@@ -1,16 +1,26 @@
 api:
-  interval: "1day"
+  interval: 1day
   outputsize: 260
+
+  # Keep batch_size small on the free plan.
+  # Each symbol in a batch still costs 1 credit.
   batch_size: 8
+
+  # OLD setting (the current code still reads this for sleeping)
   max_requests_per_min: 8
 
+  # NEW setting (we will switch the code to use this next)
+  # Free Basic is 8 API credits per minute, and 800 per day.
+  max_api_credits_per_min: 8
+
 filters:
-  min_dollar_vol_50d: 10000000
   near_52w_high_pct: 25
+  min_dollar_vol_50d: 10000000
 
 indicators:
-  sma_fast: 50
-  sma_mid: 150
+  ema_fast: 10
+  ema_mid: 20
+  ema_slow: 50
   sma_slow: 200
   atr_len: 14
 
