@@ -125,16 +125,27 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
         "format": "JSON",
     }
 
-    # Simple retry on rate limiting
-    for attempt in range(2):
-        r = requests.get(TD_BASE, params=params, timeout=30)
-        if r.status_code == 429 and attempt == 0:
-            time.sleep(65)
-            continue
-        r.raise_for_status()
-        return r.json()
+    # Retry with backoff on rate limiting and transient errors
+    backoffs = [3, 10, 30]
+    last_err = None
 
-    return {}
+    for i in range(len(backoffs) + 1):
+        try:
+            r = requests.get(TD_BASE, params=params, timeout=45)
+            if r.status_code == 429:
+                # Even "unlimited" plans can still have burst limits
+                time.sleep(backoffs[min(i, len(backoffs) - 1)])
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if i < len(backoffs):
+                time.sleep(backoffs[i])
+                continue
+            raise
+
+    raise last_err  # should never hit
 
 
 def normalise_timeseries_payload(symbol: str, payload: dict) -> pd.DataFrame:
@@ -178,7 +189,7 @@ def compute_sma(series: pd.Series, length: int) -> pd.Series:
 
 
 def prepare_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    ind = cfg.get("indicators", {})
+    ind = cfg.get("indicators", {}) or {}
     ema10_len = int(ind.get("ema_fast", 10))
     ema20_len = int(ind.get("ema_mid", 20))
     ema50_len = int(ind.get("ema_slow", 50))
@@ -198,6 +209,12 @@ def prepare_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     out["high_52w"] = out["high"].rolling(252).max()
     out["low_52w"] = out["low"].rolling(252).min()
     return out
+
+
+def pct_range(high_val: float, low_val: float) -> float:
+    if high_val <= 0:
+        return 999.0
+    return 100.0 * (high_val - low_val) / high_val
 
 
 def trend_template_minervini(df: pd.DataFrame, cfg: dict) -> tuple[bool, str]:
@@ -249,26 +266,7 @@ def trend_template_minervini(df: pd.DataFrame, cfg: dict) -> tuple[bool, str]:
     return True, "Trend template ok"
 
 
-def pct_range(high_val: float, low_val: float) -> float:
-    if high_val <= 0:
-        return 999.0
-    return 100.0 * (high_val - low_val) / high_val
-
-
 def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
-    """
-    Qullamaggie Breakout (Daily, MA-surf).
-
-    Key detail to stop false BUYs on straight uptrends:
-      - Consolidation drift rule (limits how far the base can "walk up")
-      - Pivot-high cannot be formed in the last few bars of the consolidation window
-        (prevents treating "yesterday made the high, today made a higher high" as a base breakout)
-
-    MA-surf is detected if, inside the consolidation window:
-      - >= surf_close_min_pct of closes are above one of EMA10/EMA20/EMA50
-      - that EMA is rising
-      - median distance from price to the EMA is <= surf_max_dist_pct
-    """
     out = {"signal": "PASS", "setup": "Qullamaggie Breakout", "score": 0, "entry": "", "stop": "", "reason": ""}
 
     scfg = cfg.get("setup_qullamaggie_breakout", {}) or {}
@@ -285,14 +283,13 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
     today_low = float(last["low"])
     atr = float(last.get("atr", np.nan))
 
-    impulse_lookback = int(scfg.get("impulse_lookback", 60))
+    impulse_lookback = max(10, int(scfg.get("impulse_lookback", 60)))
     impulse_min_pct = float(scfg.get("impulse_min_pct", 30.0))
 
     cons_min = int(scfg.get("cons_min_bars", 10))
     cons_max = int(scfg.get("cons_max_bars", 40))
     cons_max_depth_pct = float(scfg.get("cons_max_depth_pct", 15.0))
 
-    # Drift: allow more pullback drift than upward drift (defaults if only one value provided)
     default_drift = float(scfg.get("cons_max_drift_pct", 10.0))
     cons_max_up_drift_pct = float(scfg.get("cons_max_up_drift_pct", default_drift))
     cons_max_down_drift_pct = float(scfg.get("cons_max_down_drift_pct", default_drift))
@@ -311,8 +308,6 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
     max_breakout_extension_pct = float(scfg.get("max_breakout_extension_pct", 4.0))
     stop_width_atr_mult = float(scfg.get("stop_width_atr_mult", 1.0))
 
-    # Impulse: last close vs rolling low
-    impulse_lookback = max(10, impulse_lookback)
     impulse_low = df["low"].rolling(impulse_lookback).min().iloc[-1]
     if np.isnan(impulse_low) or impulse_low <= 0:
         out["reason"] = "Impulse calc failed"
@@ -323,7 +318,6 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = f"Impulse too small ({impulse_pct:.0f}%)"
         return out
 
-    # Trend sanity: EMA stack
     ema10 = float(last.get("ema10", np.nan))
     ema20 = float(last.get("ema20", np.nan))
     ema50 = float(last.get("ema50", np.nan))
@@ -350,21 +344,18 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
         if depth_pct > cons_max_depth_pct:
             continue
 
-        # Drift filter: prevent "just an uptrend" being treated as consolidation
         c0 = float(cons["close"].iloc[0])
         c1 = float(cons["close"].iloc[-1])
         drift_pct = 100.0 * (c1 / c0 - 1.0) if c0 > 0 else 999.0
         if drift_pct > cons_max_up_drift_pct or drift_pct < -cons_max_down_drift_pct:
             continue
 
-        # Higher-lows check (soft but useful)
         third = max(2, int(len(cons) / 3))
         low_first = float(cons["low"].iloc[:third].min())
         low_last = float(cons["low"].iloc[-third:].min())
         if low_last < low_first * (1 - higher_low_tol_pct / 100.0):
             continue
 
-        # Surf MA: choose the best among EMA10/EMA20/EMA50
         surf_candidates = [("EMA10", cons["ema10"]), ("EMA20", cons["ema20"]), ("EMA50", cons["ema50"])]
 
         best_surf = None  # (surf_score, name, ma_last, dist_med_pct, close_above_pct)
@@ -393,7 +384,6 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
         if best_surf is None:
             continue
 
-        # Pivot high must not be in the last pivot_exclude_last_n bars of the consolidation
         excl = max(0, int(pivot_exclude_last_n))
         if excl >= len(cons):
             excl = max(0, len(cons) - 1)
@@ -407,10 +397,13 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
 
         breakout = today_close > entry
 
-        # Extension checks (distance from surf MA and "too far above entry")
         ext_pct = 100.0 * (today_close / best_surf[2] - 1.0) if best_surf[2] > 0 else 999.0
         ext_atr = (today_close - best_surf[2]) / atr if (not np.isnan(atr) and atr > 0) else 0.0
-        extended = (ext_pct > max_ext_pct) or (ext_atr > max_ext_atr_mult) or (today_close > entry * (1 + max_breakout_extension_pct / 100.0))
+        extended = (
+            (ext_pct > max_ext_pct)
+            or (ext_atr > max_ext_atr_mult)
+            or (today_close > entry * (1 + max_breakout_extension_pct / 100.0))
+        )
 
         base_score = 50
         impulse_bonus = int(min(30, max(0, (impulse_pct - impulse_min_pct) / 2.0)))
@@ -448,7 +441,6 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = f"Impulse {d['impulse_pct']:.0f}%, tight {d['n']}d MA-surf ({d['surf_name']}), no breakout yet"
         return out
 
-    # BUY_NOW candidate: use today's low as LOD proxy
     stop_lod = today_low if not np.isnan(today_low) else cons_low
     stop_dist = entry - stop_lod
     if stop_dist <= 0:
@@ -523,7 +515,6 @@ def eval_minervini_vcp(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = f"VCP too deep ({depth_pct:.0f}%)"
         return out
 
-    # Contraction check via 3 segments (relaxed ratios)
     n = len(base)
     seg1 = base.iloc[: int(n * 0.45)]
     seg2 = base.iloc[int(n * 0.45): int(n * 0.75)]
@@ -542,7 +533,6 @@ def eval_minervini_vcp(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = f"No VCP contraction (r1={r1:.1f} r2={r2:.1f} r3={r3:.1f})"
         return out
 
-    # Volume dry-up (used as scoring, not a hard fail)
     vol_ok = True
     if "volume" in base.columns and base["volume"].notna().any():
         v1 = float(seg1["volume"].mean()) if not seg1.empty else np.nan
@@ -635,7 +625,6 @@ def eval_minervini_3wt(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = f"3WT drift too large ({drift_pct:.1f}%)"
         return out
 
-    # Weekly structure from 3 blocks of 5 bars when possible
     if len(base) >= 15:
         w1 = base.iloc[:5]
         w2 = base.iloc[5:10]
@@ -754,10 +743,6 @@ def main():
     with open("config.yml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    max_tickers_per_run = int(cfg.get("api", {}).get("max_tickers_per_run", 300))
-    if max_tickers_per_run < 1:
-        max_tickers_per_run = 300
-
     gc = get_gspread_client(sa_json)
     sh = gc.open_by_key(sheet_id)
 
@@ -770,19 +755,11 @@ def main():
     if not tickers:
         raise SystemExit("No tickers found (Tickers tab empty and tickers.txt empty)")
 
-    total_before_cap = len(tickers)
-    capped = False
-    if total_before_cap > max_tickers_per_run:
-        tickers = tickers[:max_tickers_per_run]
-        capped = True
-
     interval = cfg.get("api", {}).get("interval", "1day")
     outputsize = int(cfg.get("api", {}).get("outputsize", 260))
-    batch_size = int(cfg.get("api", {}).get("batch_size", 8))
-
-    max_credits_per_min = int(cfg.get("api", {}).get("max_api_credits_per_min", 8))
-    if max_credits_per_min < 1:
-        max_credits_per_min = 1
+    batch_size = int(cfg.get("api", {}).get("batch_size", 50))
+    if batch_size < 1:
+        batch_size = 50
 
     results: list[dict] = []
     errors = 0
@@ -790,8 +767,7 @@ def main():
     credits_est = 0
 
     for sym_batch in chunks(tickers, batch_size):
-        batch_credits = len(sym_batch)
-        credits_est += batch_credits
+        credits_est += len(sym_batch)
 
         try:
             data = fetch_time_series_batch(td_key, sym_batch, interval, outputsize)
@@ -837,9 +813,6 @@ def main():
                     "reason": f"Fetch error: {type(e).__name__}",
                 })
             errors += 1
-
-        sleep_s = (batch_credits / max_credits_per_min) * 60.0
-        time.sleep(sleep_s)
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -900,9 +873,7 @@ def main():
     watch_count = len(watch_items)
     pass_count = max(0, len(results) - buy_count - watch_count)
 
-    note = f"ok ({tickers_source})"
-    if capped:
-        note = f"ok ({tickers_source}) capped {len(tickers)} of {total_before_cap}"
+    note = f"ok ({tickers_source}) no cap, no pacing"
 
     summary_rows = [
         ["key", "value"],
@@ -930,7 +901,7 @@ def main():
     print("BUY_NOW signals:")
     for _, r in buy_items:
         print(r[0])
-    print(f"Done. tickers={len(tickers)} results={len(results)} buy_now={buy_count} watch={watch_count} pass={pass_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source} capped={capped}")
+    print(f"Done. tickers={len(tickers)} results={len(results)} buy_now={buy_count} watch={watch_count} pass={pass_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source}")
 
 
 if __name__ == "__main__":
