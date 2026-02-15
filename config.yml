@@ -6,7 +6,7 @@ api:
 
 filters:
   min_dollar_vol_50d: 10000000
-  near_52w_high_pct: 10
+  near_52w_high_pct: 25
 
 indicators:
   sma_fast: 50
