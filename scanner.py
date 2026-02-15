@@ -173,7 +173,7 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         if not np.isnan(base_vol_avg) and base_vol_avg > 0 and not np.isnan(last.get("volume", np.nan)):
             vol_ok = last["volume"] >= base_vol_avg * vol_mult
 
-    # Planned stop (we can use it for WATCH as well)
+    # Planned stop (used for WATCH and BUY_NOW)
     atr_val = last.get("atr", np.nan)
     stop_atr = entry - (atr_stop_mult * atr_val) if not np.isnan(atr_val) else base_low
     stop_swing = base_low
@@ -286,29 +286,41 @@ def main():
     sh = gc.open_by_key(sheet_id)
 
     ws_signals = upsert_worksheet(sh, "Signals", rows=max(1000, len(results) + 10), cols=12)
+    ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=500, cols=12)
     ws_log = upsert_worksheet(sh, "Run_Log", rows=1000, cols=12)
 
     header = ["ticker", "signal", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
     rows = [header]
+
+    buy_header = ["line", "ticker", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
+    buy_rows = [buy_header]
+
     buy_count = 0
 
     for sym, res in results:
-        if res.get("signal") == "BUY_NOW":
-            buy_count += 1
-        rows.append([
-            sym,
-            res.get("signal", ""),
-            res.get("setup", ""),
-            res.get("score", 0),
-            res.get("entry", ""),
-            res.get("stop", ""),
-            res.get("reason", ""),
-            now_utc,
-        ])
+        sig = res.get("signal", "")
+        setup = res.get("setup", "")
+        score = res.get("score", 0)
+        entry = res.get("entry", "")
+        stop = res.get("stop", "")
+        reason = res.get("reason", "")
 
+        rows.append([sym, sig, setup, score, entry, stop, reason, now_utc])
+
+        if sig == "BUY_NOW":
+            buy_count += 1
+            line = f"{sym} – BUY NOW – Setup: {setup} – Entry: {entry} – Stop: {stop} – Reason: {reason}"
+            buy_rows.append([line, sym, setup, score, entry, stop, reason, now_utc])
+
+    # Update Signals (full list)
     ws_signals.clear()
     ws_signals.update("A1", rows)
 
+    # Update BUY_NOW (shortlist only)
+    ws_buys.clear()
+    ws_buys.update("A1", buy_rows)
+
+    # Run log
     log_header = ["run_time_utc", "tickers", "buy_now", "errors", "api_calls", "notes"]
     existing = ws_log.get_all_values()
     if not existing:
@@ -316,14 +328,10 @@ def main():
 
     ws_log.append_row([now_utc, len(tickers), buy_count, errors, api_calls, "ok"], value_input_option="USER_ENTERED")
 
-    buy_lines = []
-    for sym, res in results:
-        if res.get("signal") == "BUY_NOW":
-            buy_lines.append(f"{sym} – BUY NOW – Setup: Base Breakout – Entry: {res.get('entry','')} – Stop: {res.get('stop','')} – Reason: {res.get('reason','')}")
-
+    # Console output (useful when you open the run details in GitHub Actions)
     print("BUY_NOW signals:")
-    for line in buy_lines:
-        print(line)
+    for r in buy_rows[1:]:
+        print(r[0])
     print(f"Done. tickers={len(tickers)} buy_now={buy_count} errors={errors} api_calls={api_calls}")
 
 
