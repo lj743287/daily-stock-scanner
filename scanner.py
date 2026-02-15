@@ -42,7 +42,6 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
         "format": "JSON",
     }
 
-    # Simple retry on rate limiting
     for attempt in range(2):
         r = requests.get(TD_BASE, params=params, timeout=30)
         if r.status_code == 429 and attempt == 0:
@@ -135,7 +134,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         sma200_up = False
 
     ema_stack_ok = (last["ema10"] > last["ema20"] > last["ema50"])
-
     trend_ok = (ema_stack_ok and sma200_up and near_52w_ok and liquidity_ok)
 
     if not trend_ok:
@@ -172,7 +170,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
 
     pivot = base_high
     entry = pivot * (1 + breakout_buffer_pct / 100.0)
-
     breakout_ok = last["close"] > entry
 
     vol_ok = True
@@ -231,6 +228,29 @@ def upsert_worksheet(sh, title: str, rows: int = 1000, cols: int = 20):
         return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
 
+def ensure_run_log_header(ws_log):
+    header = ["run_time_utc", "tickers", "buy_now", "errors", "api_calls", "credits_est", "notes"]
+    existing = ws_log.get_all_values()
+
+    # If sheet is empty, write header
+    if not existing:
+        ws_log.update("A1", [header])
+        return header
+
+    first_row = existing[0]
+
+    # If first cell isn't the header name, insert a header row at the top
+    if not first_row or first_row[0] != "run_time_utc":
+        ws_log.insert_row(header, 1)
+        return header
+
+    # If header exists but is different/older, overwrite row 1 with the new header
+    if first_row[:len(header)] != header:
+        ws_log.update("A1", [header])
+
+    return header
+
+
 def main():
     td_key = os.environ.get("TWELVEDATA_API_KEY", "").strip()
     sheet_id = os.environ.get("SHEET_ID", "").strip()
@@ -250,7 +270,6 @@ def main():
     outputsize = int(cfg.get("api", {}).get("outputsize", 260))
     batch_size = int(cfg.get("api", {}).get("batch_size", 8))
 
-    # NEW: credits per minute pacing (batch credits = number of tickers in the batch)
     max_credits_per_min = int(cfg.get("api", {}).get("max_api_credits_per_min", 8))
     if max_credits_per_min < 1:
         max_credits_per_min = 1
@@ -292,7 +311,6 @@ def main():
                 results.append((sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": f"Fetch error: {type(e).__name__}"}))
             errors += 1
 
-        # NEW: sleep based on credits used by this batch
         sleep_s = (batch_credits / max_credits_per_min) * 60.0
         time.sleep(sleep_s)
 
@@ -334,11 +352,7 @@ def main():
     ws_buys.clear()
     ws_buys.update("A1", buy_rows)
 
-    log_header = ["run_time_utc", "tickers", "buy_now", "errors", "api_calls", "credits_est", "notes"]
-    existing = ws_log.get_all_values()
-    if not existing:
-        ws_log.update("A1", [log_header])
-
+    ensure_run_log_header(ws_log)
     ws_log.append_row([now_utc, len(tickers), buy_count, errors, api_calls, credits_est, "ok"], value_input_option="USER_ENTERED")
 
     print("BUY_NOW signals:")
