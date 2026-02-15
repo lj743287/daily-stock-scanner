@@ -41,9 +41,17 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
         "outputsize": outputsize,
         "format": "JSON",
     }
-    r = requests.get(TD_BASE, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+
+    # Simple retry on rate limiting
+    for attempt in range(2):
+        r = requests.get(TD_BASE, params=params, timeout=30)
+        if r.status_code == 429 and attempt == 0:
+            time.sleep(65)
+            continue
+        r.raise_for_status()
+        return r.json()
+
+    return {}
 
 
 def normalise_timeseries_payload(symbol: str, payload: dict) -> pd.DataFrame:
@@ -173,7 +181,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         if not np.isnan(base_vol_avg) and base_vol_avg > 0 and not np.isnan(last.get("volume", np.nan)):
             vol_ok = last["volume"] >= base_vol_avg * vol_mult
 
-    # Planned stop (used for WATCH and BUY_NOW)
     atr_val = last.get("atr", np.nan)
     stop_atr = entry - (atr_stop_mult * atr_val) if not np.isnan(atr_val) else base_low
     stop_swing = base_low
@@ -242,14 +249,21 @@ def main():
     interval = cfg.get("api", {}).get("interval", "1day")
     outputsize = int(cfg.get("api", {}).get("outputsize", 260))
     batch_size = int(cfg.get("api", {}).get("batch_size", 8))
-    max_rpm = max(1, int(cfg.get("api", {}).get("max_requests_per_min", 8)))
-    sleep_s = 60.0 / max_rpm
+
+    # NEW: credits per minute pacing (batch credits = number of tickers in the batch)
+    max_credits_per_min = int(cfg.get("api", {}).get("max_api_credits_per_min", 8))
+    if max_credits_per_min < 1:
+        max_credits_per_min = 1
 
     results = []
     errors = 0
     api_calls = 0
+    credits_est = 0
 
     for sym_batch in chunks(tickers, batch_size):
+        batch_credits = len(sym_batch)
+        credits_est += batch_credits
+
         try:
             data = fetch_time_series_batch(td_key, sym_batch, interval, outputsize)
             api_calls += 1
@@ -278,6 +292,8 @@ def main():
                 results.append((sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": f"Fetch error: {type(e).__name__}"}))
             errors += 1
 
+        # NEW: sleep based on credits used by this batch
+        sleep_s = (batch_credits / max_credits_per_min) * 60.0
         time.sleep(sleep_s)
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -312,27 +328,23 @@ def main():
             line = f"{sym} – BUY NOW – Setup: {setup} – Entry: {entry} – Stop: {stop} – Reason: {reason}"
             buy_rows.append([line, sym, setup, score, entry, stop, reason, now_utc])
 
-    # Update Signals (full list)
     ws_signals.clear()
     ws_signals.update("A1", rows)
 
-    # Update BUY_NOW (shortlist only)
     ws_buys.clear()
     ws_buys.update("A1", buy_rows)
 
-    # Run log
-    log_header = ["run_time_utc", "tickers", "buy_now", "errors", "api_calls", "notes"]
+    log_header = ["run_time_utc", "tickers", "buy_now", "errors", "api_calls", "credits_est", "notes"]
     existing = ws_log.get_all_values()
     if not existing:
         ws_log.update("A1", [log_header])
 
-    ws_log.append_row([now_utc, len(tickers), buy_count, errors, api_calls, "ok"], value_input_option="USER_ENTERED")
+    ws_log.append_row([now_utc, len(tickers), buy_count, errors, api_calls, credits_est, "ok"], value_input_option="USER_ENTERED")
 
-    # Console output (useful when you open the run details in GitHub Actions)
     print("BUY_NOW signals:")
     for r in buy_rows[1:]:
         print(r[0])
-    print(f"Done. tickers={len(tickers)} buy_now={buy_count} errors={errors} api_calls={api_calls}")
+    print(f"Done. tickers={len(tickers)} buy_now={buy_count} errors={errors} api_calls={api_calls} credits_est={credits_est}")
 
 
 if __name__ == "__main__":
