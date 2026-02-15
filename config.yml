@@ -27,3 +27,37 @@ setup_base_breakout:
   breakout_buffer_pct: 0.2
   vol_multiplier: 1.2
   atr_stop_mult: 2.0
+
+setup_qullamaggie_breakout:
+  enabled: true
+
+  # Leader selection (within the scanned list)
+  leader_top_pct: 2
+  momentum_windows: [21, 63, 126]
+
+  # Volatility filter (ATR% = ATR14/close*100)
+  min_atr_pct: 3.0
+
+  # Impulse (big move) window BEFORE consolidation
+  impulse_lookback: 63
+  impulse_min_pct: 30.0
+  pullback_from_impulse_high_pct: 25.0
+
+  # Consolidation search window (2–8 weeks)
+  cons_min_bars: 10
+  cons_max_bars: 40
+  cons_depth_max_pct: 20.0
+
+  # MA surf and slope rules
+  surf_close_above_sma20_pct: 0.7
+  ma_rise_lookback: 5
+
+  # Breakout trigger
+  breakout_buffer_pct: 0.1
+
+  # Scoring-only (not required)
+  vol_multiplier: 1.2
+  tr_multiplier: 1.2
+
+  # Stop constraint: (entry - LOD) must be <= ATR14 * this
+  stop_max_atr_mult: 1.0
