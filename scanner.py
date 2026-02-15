@@ -199,7 +199,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     df["ema50"] = ema50
     df["sma200"] = sma200
     df["atr"] = atr
-    df["dollar_vol"] = df["close"] * df.get("volume", 0)
 
     last = df.iloc[-1]
     idx_last = df.index[-1]
@@ -208,11 +207,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     high_52w = df["high"].rolling(252).max().iloc[-1]
     near_pct = float(cfg.get("filters", {}).get("near_52w_high_pct", 25))
     near_52w_ok = last["close"] >= (1 - near_pct / 100.0) * high_52w
-
-    # Liquidity check (50-day average close*volume)
-    min_dv = float(cfg.get("filters", {}).get("min_dollar_vol_50d", 10000000))
-    dv50 = df["dollar_vol"].rolling(50).mean().iloc[-1]
-    liquidity_ok = dv50 >= min_dv
 
     # 200MA rising check (today > 20 trading days ago)
     if idx_last - 20 >= 0:
@@ -223,7 +217,8 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     # EMA rule: 10EMA > 20EMA > 50EMA
     ema_stack_ok = (last["ema10"] > last["ema20"] > last["ema50"])
 
-    trend_ok = (ema_stack_ok and sma200_up and near_52w_ok and liquidity_ok)
+    # Liquidity filter removed
+    trend_ok = (ema_stack_ok and sma200_up and near_52w_ok)
 
     if not trend_ok:
         fails = []
@@ -233,8 +228,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
             fails.append("200MA not rising")
         if not near_52w_ok:
             fails.append("not near 52w high")
-        if not liquidity_ok:
-            fails.append("liquidity")
         out["reason"] = "Trend fail: " + ", ".join(fails)
         return out
 
