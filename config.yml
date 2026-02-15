@@ -1,9 +1,8 @@
 api:
   interval: 1day
   outputsize: 260
-  batch_size: 8
-  max_api_credits_per_min: 8
-  max_tickers_per_run: 300
+  # Increase this if you want faster runs; batching is only to avoid request/URL-size issues.
+  batch_size: 50
 
 indicators:
   ema_fast: 10
