@@ -13,11 +13,19 @@ TD_BASE = "https://api.twelvedata.com/time_series"
 
 
 def read_tickers(path: str) -> list[str]:
-    # Accepts either:
-    # 1) One ticker per line: AAPL
-    # 2) TradingView export: NYSE:AA,NASDAQ:MSFT,...
-    tickers = []
+    """
+    Accepts either:
+    1) One ticker per line: AAPL
+    2) TradingView export: NYSE:AA,NASDAQ:MSFT,...
+    Converts EXCHANGE:TICKER -> TICKER:EXCHANGE to make symbols less ambiguous.
+    Example: NASDAQ:MSFT -> MSFT:NASDAQ
+    """
+    tickers: list[str] = []
     seen = set()
+
+    known_exchanges = {
+        "NYSE", "NASDAQ", "AMEX", "NYSEARCA", "ARCA", "BATS", "IEX", "OTC"
+    }
 
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -25,13 +33,29 @@ def read_tickers(path: str) -> list[str]:
             if not line or line.startswith("#"):
                 continue
 
+            # Split both comma-separated and line-separated inputs
             parts = [p.strip() for p in line.split(",") if p.strip()]
 
             for p in parts:
                 if p.startswith("#"):
                     continue
 
-                sym = p.split(":")[-1].strip().upper()
+                p = p.strip()
+
+                if ":" in p:
+                    left, right = p.split(":", 1)
+                    left_u = left.strip().upper()
+                    right_u = right.strip().upper()
+
+                    # If it looks like TradingView (EXCHANGE:TICKER), swap it
+                    if left_u in known_exchanges and right_u:
+                        sym = f"{right_u}:{left_u}"
+                    else:
+                        # Already in Twelve Data style (TICKER:EXCHANGE) or something else
+                        sym = p.strip().upper()
+                else:
+                    sym = p.strip().upper()
+
                 if sym and sym not in seen:
                     tickers.append(sym)
                     seen.add(sym)
@@ -138,20 +162,25 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     last = df.iloc[-1]
     idx_last = df.index[-1]
 
+    # 52-week high check
     high_52w = df["high"].rolling(252).max().iloc[-1]
     near_pct = float(cfg.get("filters", {}).get("near_52w_high_pct", 25))
     near_52w_ok = last["close"] >= (1 - near_pct / 100.0) * high_52w
 
+    # Liquidity check (50-day average close*volume)
     min_dv = float(cfg.get("filters", {}).get("min_dollar_vol_50d", 10000000))
     dv50 = df["dollar_vol"].rolling(50).mean().iloc[-1]
     liquidity_ok = dv50 >= min_dv
 
+    # 200MA rising check (today > 20 trading days ago)
     if idx_last - 20 >= 0:
         sma200_up = df["sma200"].iloc[-1] > df["sma200"].iloc[-21]
     else:
         sma200_up = False
 
+    # EMA rule: 10EMA > 20EMA > 50EMA
     ema_stack_ok = (last["ema10"] > last["ema20"] > last["ema50"])
+
     trend_ok = (ema_stack_ok and sma200_up and near_52w_ok and liquidity_ok)
 
     if not trend_ok:
@@ -167,6 +196,7 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = "Trend fail: " + ", ".join(fails)
         return out
 
+    # Base Breakout setup
     base_cfg = cfg.get("setup_base_breakout", {})
     base_n = int(base_cfg.get("base_lookback", 30))
     base_max_depth_pct = float(base_cfg.get("base_max_depth_pct", 15))
@@ -232,7 +262,9 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     out["score"] = score
     out["entry"] = f"{entry:.2f}"
     out["stop"] = f"{stop:.2f}"
-    out["reason"] = "Trend up (EMA stack), 200MA rising, near 52w high, tight base, broke pivot" + (", volume ok" if vol_ok else ", volume weak")
+    out["reason"] = "Trend up (EMA stack), 200MA rising, near 52w high, tight base, broke pivot" + (
+        ", volume ok" if vol_ok else ", volume weak"
+    )
     return out
 
 
@@ -287,6 +319,7 @@ def main():
     outputsize = int(cfg.get("api", {}).get("outputsize", 260))
     batch_size = int(cfg.get("api", {}).get("batch_size", 8))
 
+    # Credits-per-minute pacing (batch credits = number of tickers in the batch)
     max_credits_per_min = int(cfg.get("api", {}).get("max_api_credits_per_min", 8))
     if max_credits_per_min < 1:
         max_credits_per_min = 1
@@ -304,6 +337,7 @@ def main():
             data = fetch_time_series_batch(td_key, sym_batch, interval, outputsize)
             api_calls += 1
 
+            # If Twelve Data returns a single-series payload (should be 1 symbol only)
             if isinstance(data, dict) and "values" in data:
                 sym = sym_batch[0]
                 df = normalise_timeseries_payload(sym, data)
@@ -325,7 +359,9 @@ def main():
 
         except Exception as e:
             for sym in sym_batch:
-                results.append((sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": f"Fetch error: {type(e).__name__}"}))
+                results.append(
+                    (sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": f"Fetch error: {type(e).__name__}"})
+                )
             errors += 1
 
         sleep_s = (batch_credits / max_credits_per_min) * 60.0
@@ -348,10 +384,11 @@ def main():
     buy_rows = [buy_header]
 
     watch_header = ["ticker", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
-    watch_items = []
+    watch_rows = [watch_header]
 
-    buy_items = []
     buy_count = 0
+    buy_items = []
+    watch_items = []
 
     for sym, res in results:
         sig = res.get("signal", "")
@@ -375,15 +412,15 @@ def main():
     ws_signals.clear()
     ws_signals.update("A1", rows)
 
-    # BUY_NOW shortlist (sorted by score, highest first)
+    # BUY_NOW shortlist (sorted high score first)
     buy_items.sort(key=lambda x: x[0], reverse=True)
     buy_rows.extend([row for _, row in buy_items])
     ws_buys.clear()
     ws_buys.update("A1", buy_rows)
 
-    # WATCH shortlist (sorted by score, highest first)
+    # WATCH shortlist (sorted high score first)
     watch_items.sort(key=lambda x: x[0], reverse=True)
-    watch_rows = [watch_header] + [row for _, row in watch_items]
+    watch_rows.extend([row for _, row in watch_items])
     ws_watch.clear()
     ws_watch.update("A1", watch_rows)
 
