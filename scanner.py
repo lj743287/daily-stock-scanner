@@ -133,7 +133,6 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
         try:
             r = requests.get(TD_BASE, params=params, timeout=45)
             if r.status_code == 429:
-                # Even "unlimited" plans can still have burst limits
                 time.sleep(backoffs[min(i, len(backoffs) - 1)])
                 continue
             r.raise_for_status()
@@ -145,7 +144,7 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
                 continue
             raise
 
-    raise last_err  # should never hit
+    raise last_err
 
 
 def normalise_timeseries_payload(symbol: str, payload: dict) -> pd.DataFrame:
@@ -218,14 +217,6 @@ def pct_range(high_val: float, low_val: float) -> float:
 
 
 def trend_template_minervini(df: pd.DataFrame, cfg: dict) -> tuple[bool, str]:
-    """
-    Minervini Trend Template (simplified, deterministic):
-      - Close > SMA50
-      - SMA50 > SMA150 > SMA200
-      - SMA150 rising (today > 20 trading days ago)
-      - SMA200 rising (today > 20 trading days ago)
-      - Close within near_52w_high_pct of 52w high (skipped if 52w not available)
-    """
     last = df.iloc[-1]
     near_pct = float(cfg.get("filters", {}).get("near_52w_high_pct", 25))
 
@@ -732,6 +723,43 @@ def ensure_run_log_header(ws_log):
     return header
 
 
+def rate_limit_wait(batch_credits: int, max_credits_per_min: int, state: dict) -> None:
+    """
+    Enforces a simple per-minute credits window.
+    We assume 1 credit per symbol in the batch.
+
+    state keys:
+      - window_start (monotonic seconds)
+      - used (credits used in current window)
+    """
+    if max_credits_per_min <= 0:
+        return
+
+    now = time.monotonic()
+    window_start = state.get("window_start", now)
+    used = int(state.get("used", 0))
+
+    elapsed = now - window_start
+    if elapsed >= 60.0:
+        # reset window
+        state["window_start"] = now
+        state["used"] = 0
+        window_start = now
+        used = 0
+        elapsed = 0.0
+
+    if used + batch_credits <= max_credits_per_min:
+        state["used"] = used + batch_credits
+        return
+
+    sleep_s = max(0.0, 60.0 - elapsed) + 0.2
+    time.sleep(sleep_s)
+
+    # after sleep, reset window and book the credits
+    state["window_start"] = time.monotonic()
+    state["used"] = batch_credits
+
+
 def main():
     td_key = os.environ.get("TWELVEDATA_API_KEY", "").strip()
     sheet_id = os.environ.get("SHEET_ID", "").strip()
@@ -757,17 +785,30 @@ def main():
 
     interval = cfg.get("api", {}).get("interval", "1day")
     outputsize = int(cfg.get("api", {}).get("outputsize", 260))
+
+    max_credits_per_min = int(cfg.get("api", {}).get("max_api_credits_per_min", 55))
+    if max_credits_per_min < 1:
+        max_credits_per_min = 55
+
     batch_size = int(cfg.get("api", {}).get("batch_size", 50))
     if batch_size < 1:
         batch_size = 50
+    # Never allow a batch bigger than the per-minute credit cap, otherwise you cannot be compliant.
+    batch_size = min(batch_size, max_credits_per_min)
 
     results: list[dict] = []
     errors = 0
     api_calls = 0
     credits_est = 0
 
+    rl_state = {"window_start": time.monotonic(), "used": 0}
+
     for sym_batch in chunks(tickers, batch_size):
-        credits_est += len(sym_batch)
+        batch_credits = len(sym_batch)
+        credits_est += batch_credits
+
+        # Respect provider limits (Grow 55 = 55 credits/min).
+        rate_limit_wait(batch_credits, max_credits_per_min, rl_state)
 
         try:
             data = fetch_time_series_batch(td_key, sym_batch, interval, outputsize)
@@ -873,7 +914,7 @@ def main():
     watch_count = len(watch_items)
     pass_count = max(0, len(results) - buy_count - watch_count)
 
-    note = f"ok ({tickers_source}) no cap, no pacing"
+    note = f"ok ({tickers_source}) paced at {max_credits_per_min}/min, batch_size={batch_size}"
 
     summary_rows = [
         ["key", "value"],
