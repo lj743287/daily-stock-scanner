@@ -173,66 +173,91 @@ def compute_ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 
-def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
-    out = {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": ""}
+def compute_sma(series: pd.Series, length: int) -> pd.Series:
+    return series.rolling(length).mean()
 
-    if df.empty or len(df) < 220:
-        out["reason"] = "Not enough daily data"
-        return out
 
-    ema10_len = int(cfg.get("indicators", {}).get("ema_fast", 10))
-    ema20_len = int(cfg.get("indicators", {}).get("ema_mid", 20))
-    ema50_len = int(cfg.get("indicators", {}).get("ema_slow", 50))
+def compute_return(df: pd.DataFrame, lookback: int) -> float:
+    # Total return close(today)/close(N days ago) - 1
+    if df is None or df.empty:
+        return np.nan
+    if len(df) < lookback + 2:
+        return np.nan
+    now = df["close"].iloc[-1]
+    past = df["close"].iloc[-1 - lookback]
+    if past is None or np.isnan(past) or past == 0:
+        return np.nan
+    return (now / past) - 1.0
 
-    sma200_len = int(cfg.get("indicators", {}).get("sma_slow", 200))
-    atr_len = int(cfg.get("indicators", {}).get("atr_len", 14))
 
-    ema10 = compute_ema(df["close"], ema10_len)
-    ema20 = compute_ema(df["close"], ema20_len)
-    ema50 = compute_ema(df["close"], ema50_len)
-    sma200 = df["close"].rolling(sma200_len).mean()
-    atr = compute_atr(df, atr_len)
+def compute_leader_flags(df_map: dict[str, pd.DataFrame], cfg: dict) -> dict[str, bool]:
+    qcfg = cfg.get("setup_qullamaggie_breakout", {}) or {}
+    enabled = bool(qcfg.get("enabled", True))
+    if not enabled:
+        return {sym: False for sym in df_map.keys()}
 
-    df = df.copy()
-    df["ema10"] = ema10
-    df["ema20"] = ema20
-    df["ema50"] = ema50
-    df["sma200"] = sma200
-    df["atr"] = atr
+    top_pct = float(qcfg.get("leader_top_pct", 2.0))
+    windows = qcfg.get("momentum_windows", [21, 63, 126])
+    windows = [int(x) for x in windows] if isinstance(windows, list) else [21, 63, 126]
 
-    last = df.iloc[-1]
-    idx_last = df.index[-1]
+    rets_by_sym: dict[str, dict[int, float]] = {}
+    for sym, df in df_map.items():
+        if df is None or df.empty:
+            continue
+        rets_by_sym[sym] = {}
+        for w in windows:
+            rets_by_sym[sym][w] = compute_return(df, w)
 
-    # 52-week high check
-    high_52w = df["high"].rolling(252).max().iloc[-1]
-    near_pct = float(cfg.get("filters", {}).get("near_52w_high_pct", 25))
-    near_52w_ok = last["close"] >= (1 - near_pct / 100.0) * high_52w
+    thresholds: dict[int, float] = {}
+    for w in windows:
+        vals = [rets_by_sym[sym].get(w, np.nan) for sym in rets_by_sym.keys()]
+        vals = [v for v in vals if not np.isnan(v)]
+        if len(vals) < 10:
+            thresholds[w] = np.inf  # effectively disables leader test when too few symbols
+        else:
+            q = 1.0 - (top_pct / 100.0)
+            thresholds[w] = float(np.quantile(vals, q))
 
-    # 200MA rising check (today > 20 trading days ago)
-    if idx_last - 20 >= 0:
-        sma200_up = df["sma200"].iloc[-1] > df["sma200"].iloc[-21]
-    else:
-        sma200_up = False
+    flags: dict[str, bool] = {}
+    for sym in df_map.keys():
+        ok = False
+        if sym in rets_by_sym:
+            for w in windows:
+                v = rets_by_sym[sym].get(w, np.nan)
+                thr = thresholds.get(w, np.inf)
+                if not np.isnan(v) and v >= thr and v > 0:
+                    ok = True
+                    break
+        flags[sym] = ok
 
-    # EMA rule: 10EMA > 20EMA > 50EMA
-    ema_stack_ok = (last["ema10"] > last["ema20"] > last["ema50"])
+    return flags
 
-    # Liquidity filter removed
-    trend_ok = (ema_stack_ok and sma200_up and near_52w_ok)
 
-    if not trend_ok:
-        fails = []
-        if not ema_stack_ok:
-            fails.append("EMA stack")
-        if not sma200_up:
-            fails.append("200MA not rising")
-        if not near_52w_ok:
-            fails.append("not near 52w high")
-        out["reason"] = "Trend fail: " + ", ".join(fails)
-        return out
+def pick_best(results: list[dict]) -> dict:
+    # Prefer BUY_NOW > WATCH > PASS, then higher score
+    rank = {"PASS": 0, "WATCH": 1, "BUY_NOW": 2}
 
-    # Base Breakout setup
-    base_cfg = cfg.get("setup_base_breakout", {})
+    best = None
+    for r in results:
+        if not r:
+            continue
+        if best is None:
+            best = r
+            continue
+        if rank.get(r.get("signal", "PASS"), 0) > rank.get(best.get("signal", "PASS"), 0):
+            best = r
+            continue
+        if rank.get(r.get("signal", "PASS"), 0) == rank.get(best.get("signal", "PASS"), 0):
+            if int(r.get("score", 0) or 0) > int(best.get("score", 0) or 0):
+                best = r
+
+    return best or {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": ""}
+
+
+def eval_base_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> dict:
+    out = {"signal": "PASS", "setup": "Base Breakout", "score": 0, "entry": "", "stop": "", "reason": ""}
+
+    base_cfg = cfg.get("setup_base_breakout", {}) or {}
     base_n = int(base_cfg.get("base_lookback", 30))
     base_max_depth_pct = float(base_cfg.get("base_max_depth_pct", 15))
     breakout_buffer_pct = float(base_cfg.get("breakout_buffer_pct", 0.2))
@@ -241,7 +266,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
 
     if len(df) < base_n + 2:
         out["signal"] = "WATCH"
-        out["setup"] = "Base Breakout"
         out["reason"] = "Trend ok, base window too small"
         out["score"] = 40
         return out
@@ -262,7 +286,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         if not np.isnan(base_vol_avg) and base_vol_avg > 0 and not np.isnan(last.get("volume", np.nan)):
             vol_ok = last["volume"] >= base_vol_avg * vol_mult
 
-    # Planned stop (used for WATCH and BUY_NOW)
     atr_val = last.get("atr", np.nan)
     stop_atr = entry - (atr_stop_mult * atr_val) if not np.isnan(atr_val) else base_low
     stop_swing = base_low
@@ -272,7 +295,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
 
     if not tight_ok:
         out["signal"] = "WATCH"
-        out["setup"] = "Base Breakout"
         out["reason"] = "Trend ok, but base not tight"
         out["score"] = 55
         out["entry"] = f"{entry:.2f}"
@@ -281,7 +303,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
 
     if not breakout_ok:
         out["signal"] = "WATCH"
-        out["setup"] = "Base Breakout"
         out["reason"] = "Trend ok, tight base, no breakout yet"
         out["score"] = 70
         out["entry"] = f"{entry:.2f}"
@@ -293,14 +314,267 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     score = int(min(100, score + tight_bonus))
 
     out["signal"] = "BUY_NOW"
-    out["setup"] = "Base Breakout"
     out["score"] = score
     out["entry"] = f"{entry:.2f}"
     out["stop"] = f"{stop:.2f}"
-    out["reason"] = "Trend up (EMA stack), 200MA rising, near 52w high, tight base, broke pivot" + (
-        ", volume ok" if vol_ok else ", volume weak"
+    out["reason"] = "Trend up, tight base, broke pivot" + (", volume ok" if vol_ok else ", volume weak")
+    return out
+
+
+def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, leader_ok: bool) -> dict:
+    out = {"signal": "PASS", "setup": "Qullamaggie Breakout", "score": 0, "entry": "", "stop": "", "reason": ""}
+
+    qcfg = cfg.get("setup_qullamaggie_breakout", {}) or {}
+    if not bool(qcfg.get("enabled", True)):
+        out["reason"] = "Setup disabled"
+        return out
+
+    if not leader_ok:
+        out["reason"] = "Not a momentum leader (top percentile in 1/3/6M within scan list)"
+        return out
+
+    atr_val = last.get("atr", np.nan)
+    if np.isnan(atr_val) or atr_val <= 0:
+        out["reason"] = "ATR unavailable"
+        return out
+
+    min_atr_pct = float(qcfg.get("min_atr_pct", 0.0))
+    atr_pct = (atr_val / last["close"]) * 100.0 if last["close"] and last["close"] > 0 else 0.0
+    if min_atr_pct > 0 and atr_pct < min_atr_pct:
+        out["reason"] = f"ATR% too low ({atr_pct:.2f} < {min_atr_pct:.2f})"
+        return out
+
+    impulse_lookback = int(qcfg.get("impulse_lookback", 63))
+    impulse_min_pct = float(qcfg.get("impulse_min_pct", 30.0))
+    pullback_from_impulse_high_pct = float(qcfg.get("pullback_from_impulse_high_pct", 25.0))
+
+    cons_min = int(qcfg.get("cons_min_bars", 10))
+    cons_max = int(qcfg.get("cons_max_bars", 40))
+    cons_depth_max_pct = float(qcfg.get("cons_depth_max_pct", 20.0))
+
+    surf_pct = float(qcfg.get("surf_close_above_sma20_pct", 0.7))
+    ma_rise_lookback = int(qcfg.get("ma_rise_lookback", 5))
+
+    breakout_buffer_pct = float(qcfg.get("breakout_buffer_pct", 0.1))
+    vol_mult = float(qcfg.get("vol_multiplier", 1.2))
+    tr_mult = float(qcfg.get("tr_multiplier", 1.2))
+    stop_max_atr_mult = float(qcfg.get("stop_max_atr_mult", 1.0))
+
+    best = None
+
+    # We exclude today from consolidation window; today is breakout-check day
+    for cons_len in range(cons_min, cons_max + 1):
+        need = cons_len + impulse_lookback + 2
+        if len(df) < need:
+            continue
+
+        cons = df.iloc[-(cons_len + 1):-1]
+        if cons.empty:
+            continue
+
+        cons_high = cons["high"].max()
+        cons_low = cons["low"].min()
+        if not cons_high or cons_high <= 0:
+            continue
+
+        depth_pct = 100.0 * (cons_high - cons_low) / cons_high
+        if depth_pct > cons_depth_max_pct:
+            continue
+
+        # Higher lows: last third low > first third low
+        n = len(cons)
+        one_third = max(1, n // 3)
+        early = cons.iloc[:one_third]
+        late = cons.iloc[-one_third:]
+        if late["low"].min() <= early["low"].min():
+            continue
+
+        # Surfing: % of closes above SMA20 in window
+        if "sma20" not in cons.columns or cons["sma20"].isna().all():
+            continue
+        frac_above = float((cons["close"] >= cons["sma20"]).mean())
+        if frac_above < surf_pct:
+            continue
+
+        # 10/20 rising into the end of the consolidation (yesterday vs N days ago)
+        idx_end = len(df) - 2
+        idx_prev = idx_end - ma_rise_lookback
+        if idx_prev < 0:
+            continue
+        if df["sma10"].iloc[idx_end] <= df["sma10"].iloc[idx_prev]:
+            continue
+        if df["sma20"].iloc[idx_end] <= df["sma20"].iloc[idx_prev]:
+            continue
+
+        # Impulse window immediately before consolidation
+        pre = df.iloc[-(cons_len + impulse_lookback + 1):-(cons_len + 1)]
+        if pre.empty:
+            continue
+
+        low_idx = int(pre["low"].idxmin())
+        high_idx = int(pre["high"].idxmax())
+        if high_idx <= low_idx:
+            continue
+
+        impulse_low = float(pre["low"].min())
+        impulse_high = float(pre["high"].max())
+        if impulse_low <= 0:
+            continue
+
+        impulse_pct = 100.0 * (impulse_high / impulse_low - 1.0)
+        if impulse_pct < impulse_min_pct:
+            continue
+
+        # Pullback constraint: consolidation stays within X% of impulse high
+        min_cons_high = impulse_high * (1.0 - pullback_from_impulse_high_pct / 100.0)
+        if cons_high < min_cons_high:
+            continue
+
+        # Score this consolidation candidate (prefer tighter)
+        tight_bonus = int(max(0, min(25, (cons_depth_max_pct - depth_pct) * 1.5)))
+        surf_bonus = int(max(0, min(10, (frac_above - surf_pct) * 20)))
+        cand_score = 60 + tight_bonus + surf_bonus
+
+        cand = {
+            "cons_len": cons_len,
+            "cons_high": cons_high,
+            "cons_low": cons_low,
+            "depth_pct": depth_pct,
+            "frac_above": frac_above,
+            "impulse_pct": impulse_pct,
+            "score_base": int(min(85, cand_score)),
+        }
+
+        if best is None or cand["score_base"] > best["score_base"]:
+            best = cand
+
+    if best is None:
+        out["reason"] = "No valid MA-surf consolidation found"
+        return out
+
+    pivot = best["cons_high"]
+    entry = pivot * (1 + breakout_buffer_pct / 100.0)
+    breakout_ok = last["close"] > entry
+
+    # Range/volume expansion (scoring only)
+    # TR today:
+    prev_close = df["close"].iloc[-2]
+    tr_today = max(
+        abs(last["high"] - last["low"]),
+        abs(last["high"] - prev_close),
+        abs(last["low"] - prev_close),
+    )
+    cons = df.iloc[-(best["cons_len"] + 1):-1]
+    tr_cons = (cons["high"] - cons["low"]).abs().mean() if not cons.empty else np.nan
+    tr_ok = (not np.isnan(tr_cons)) and tr_today >= tr_cons * tr_mult
+
+    vol_ok = True
+    if "volume" in df.columns and df["volume"].notna().any():
+        cons_vol = cons["volume"].mean()
+        if not np.isnan(cons_vol) and cons_vol > 0 and not np.isnan(last.get("volume", np.nan)):
+            vol_ok = last["volume"] >= cons_vol * vol_mult
+
+    if not breakout_ok:
+        # WATCH: use conservative support as stop proxy, but rule reminder in reason
+        out["signal"] = "WATCH"
+        out["entry"] = f"{entry:.2f}"
+        out["stop"] = f"{best['cons_low']:.2f}"
+        out["score"] = int(min(100, best["score_base"]))
+        out["reason"] = (
+            f"Leader ok, impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d surf, no breakout yet; "
+            "stop on entry is LOD and must be <= 1x ATR"
+        )
+        return out
+
+    # Breakout day stop rule: LOD, with ATR width constraint
+    stop = float(last["low"])
+    stop_dist = float(entry - stop)
+
+    if stop_dist <= 0:
+        out["reason"] = "Invalid stop (LOD >= entry)"
+        return out
+
+    if stop_dist > atr_val * stop_max_atr_mult:
+        out["reason"] = "Stop too wide vs ATR (LOD rule fails)"
+        return out
+
+    score = best["score_base"] + 10
+    if vol_ok:
+        score += 5
+    if tr_ok:
+        score += 5
+    score = int(min(100, score))
+
+    out["signal"] = "BUY_NOW"
+    out["score"] = score
+    out["entry"] = f"{entry:.2f}"
+    out["stop"] = f"{stop:.2f}"
+    out["reason"] = (
+        f"Leader ok, impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d MA-surf, broke range"
+        + (", volume ok" if vol_ok else ", volume weak")
+        + (", range expanded" if tr_ok else "")
     )
     return out
+
+
+def analyse_symbol(df: pd.DataFrame, cfg: dict, leader_ok: bool) -> dict:
+    out = {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": ""}
+
+    if df.empty or len(df) < 220:
+        out["reason"] = "Not enough daily data"
+        return out
+
+    ema10_len = int(cfg.get("indicators", {}).get("ema_fast", 10))
+    ema20_len = int(cfg.get("indicators", {}).get("ema_mid", 20))
+    ema50_len = int(cfg.get("indicators", {}).get("ema_slow", 50))
+    sma200_len = int(cfg.get("indicators", {}).get("sma_slow", 200))
+    atr_len = int(cfg.get("indicators", {}).get("atr_len", 14))
+
+    df = df.copy()
+    df["ema10"] = compute_ema(df["close"], ema10_len)
+    df["ema20"] = compute_ema(df["close"], ema20_len)
+    df["ema50"] = compute_ema(df["close"], ema50_len)
+    df["sma200"] = df["close"].rolling(sma200_len).mean()
+    df["atr"] = compute_atr(df, atr_len)
+
+    # SMAs for Qullamaggie surf rules
+    df["sma10"] = compute_sma(df["close"], 10)
+    df["sma20"] = compute_sma(df["close"], 20)
+    df["sma50"] = compute_sma(df["close"], 50)
+
+    last = df.iloc[-1]
+    idx_last = df.index[-1]
+
+    # Trend Template filter (global pre-filter)
+    high_52w = df["high"].rolling(252).max().iloc[-1]
+    near_pct = float(cfg.get("filters", {}).get("near_52w_high_pct", 25))
+    near_52w_ok = last["close"] >= (1 - near_pct / 100.0) * high_52w
+
+    if idx_last - 20 >= 0:
+        sma200_up = df["sma200"].iloc[-1] > df["sma200"].iloc[-21]
+    else:
+        sma200_up = False
+
+    ema_stack_ok = (last["ema10"] > last["ema20"] > last["ema50"])
+    trend_ok = (ema_stack_ok and sma200_up and near_52w_ok)
+
+    if not trend_ok:
+        fails = []
+        if not ema_stack_ok:
+            fails.append("EMA stack")
+        if not sma200_up:
+            fails.append("200MA not rising")
+        if not near_52w_ok:
+            fails.append("not near 52w high")
+        out["reason"] = "Trend fail: " + ", ".join(fails)
+        return out
+
+    # Evaluate setups and choose best
+    r1 = eval_base_breakout(df, cfg, last)
+    r2 = eval_qullamaggie_breakout(df, cfg, last, leader_ok)
+
+    best = pick_best([r1, r2])
+    return best
 
 
 def get_gspread_client(sa_json_text: str):
@@ -376,7 +650,9 @@ def main():
     if max_credits_per_min < 1:
         max_credits_per_min = 1
 
-    results = []
+    df_map: dict[str, pd.DataFrame] = {}
+    err_map: dict[str, str] = {}
+
     errors = 0
     api_calls = 0
     credits_est = 0
@@ -389,34 +665,46 @@ def main():
             data = fetch_time_series_batch(td_key, sym_batch, interval, outputsize)
             api_calls += 1
 
-            if isinstance(data, dict) and "values" in data:
+            # Single-symbol response shape: {"values":[...], ...}
+            if isinstance(data, dict) and "values" in data and len(sym_batch) == 1:
                 sym = sym_batch[0]
                 df = normalise_timeseries_payload(sym, data)
-                res = analyse_symbol(df, cfg)
-                results.append((sym, res))
+                df_map[sym] = df
+                if df.empty:
+                    err_map[sym] = data.get("message", "No data")
             else:
+                # Multi-symbol response shape: { "AAPL": {...}, "MSFT": {...}, ... }
                 for sym in sym_batch:
-                    payload = data.get(sym, {})
+                    payload = {}
+                    if isinstance(data, dict):
+                        payload = data.get(sym, {}) or {}
                     df = normalise_timeseries_payload(sym, payload)
-                    res = analyse_symbol(df, cfg) if not df.empty else {
-                        "signal": "PASS",
-                        "setup": "",
-                        "score": 0,
-                        "entry": "",
-                        "stop": "",
-                        "reason": payload.get("message", "No data"),
-                    }
-                    results.append((sym, res))
+                    df_map[sym] = df
+                    if df.empty:
+                        msg = payload.get("message")
+                        if not msg and isinstance(data, dict):
+                            msg = data.get("message")
+                        err_map[sym] = msg or "No data"
 
         except Exception as e:
             for sym in sym_batch:
-                results.append(
-                    (sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": f"Fetch error: {type(e).__name__}"})
-                )
+                df_map[sym] = pd.DataFrame()
+                err_map[sym] = f"Fetch error: {type(e).__name__}"
             errors += 1
 
         sleep_s = (batch_credits / max_credits_per_min) * 60.0
         time.sleep(sleep_s)
+
+    leader_flags = compute_leader_flags(df_map, cfg)
+
+    results = []
+    for sym in tickers:
+        df = df_map.get(sym, pd.DataFrame())
+        if df is None or df.empty:
+            results.append((sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": err_map.get(sym, "No data")}))
+            continue
+        res = analyse_symbol(df, cfg, leader_flags.get(sym, False))
+        results.append((sym, res))
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -447,7 +735,6 @@ def main():
         stop = res.get("stop", "")
         reason = res.get("reason", "")
 
-        # Keep raw symbol in Signals (helps debugging)
         rows.append([sym, sig, setup, score, entry, stop, reason, now_utc])
 
         sym_disp = display_ticker(sym)
@@ -505,7 +792,10 @@ def main():
     print("BUY_NOW signals:")
     for _, r in buy_items:
         print(r[0])
-    print(f"Done. tickers={len(tickers)} buy_now={buy_count} watch={watch_count} pass={pass_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source} capped={capped}")
+    print(
+        f"Done. tickers={len(tickers)} buy_now={buy_count} watch={watch_count} pass={pass_count} "
+        f"errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source} capped={capped}"
+    )
 
 
 if __name__ == "__main__":
