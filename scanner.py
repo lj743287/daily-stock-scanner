@@ -25,22 +25,18 @@ def read_tickers(path: str) -> list[str]:
             if not line or line.startswith("#"):
                 continue
 
-            # Split both comma-separated and line-separated inputs
             parts = [p.strip() for p in line.split(",") if p.strip()]
 
             for p in parts:
                 if p.startswith("#"):
                     continue
 
-                # Strip exchange prefix if present, e.g. NASDAQ:MSFT -> MSFT
                 sym = p.split(":")[-1].strip().upper()
-
                 if sym and sym not in seen:
                     tickers.append(sym)
                     seen.add(sym)
 
     return tickers
-
 
 
 def chunks(items: list[str], n: int) -> list[list[str]]:
@@ -63,6 +59,7 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
         "format": "JSON",
     }
 
+    # Simple retry on rate limiting
     for attempt in range(2):
         r = requests.get(TD_BASE, params=params, timeout=30)
         if r.status_code == 429 and attempt == 0:
@@ -179,6 +176,7 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
 
     if len(df) < base_n + 2:
         out["signal"] = "WATCH"
+        out["setup"] = "Base Breakout"
         out["reason"] = "Trend ok, base window too small"
         out["score"] = 40
         return out
@@ -199,6 +197,7 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         if not np.isnan(base_vol_avg) and base_vol_avg > 0 and not np.isnan(last.get("volume", np.nan)):
             vol_ok = last["volume"] >= base_vol_avg * vol_mult
 
+    # Planned stop (used for WATCH and BUY_NOW)
     atr_val = last.get("atr", np.nan)
     stop_atr = entry - (atr_stop_mult * atr_val) if not np.isnan(atr_val) else base_low
     stop_swing = base_low
@@ -253,19 +252,16 @@ def ensure_run_log_header(ws_log):
     header = ["run_time_utc", "tickers", "buy_now", "errors", "api_calls", "credits_est", "notes"]
     existing = ws_log.get_all_values()
 
-    # If sheet is empty, write header
     if not existing:
         ws_log.update("A1", [header])
         return header
 
     first_row = existing[0]
 
-    # If first cell isn't the header name, insert a header row at the top
     if not first_row or first_row[0] != "run_time_utc":
         ws_log.insert_row(header, 1)
         return header
 
-    # If header exists but is different/older, overwrite row 1 with the new header
     if first_row[:len(header)] != header:
         ws_log.update("A1", [header])
 
@@ -342,6 +338,7 @@ def main():
 
     ws_signals = upsert_worksheet(sh, "Signals", rows=max(1000, len(results) + 10), cols=12)
     ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=500, cols=12)
+    ws_watch = upsert_worksheet(sh, "WATCH", rows=1000, cols=12)
     ws_log = upsert_worksheet(sh, "Run_Log", rows=1000, cols=12)
 
     header = ["ticker", "signal", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
@@ -350,12 +347,16 @@ def main():
     buy_header = ["line", "ticker", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
     buy_rows = [buy_header]
 
+    watch_header = ["ticker", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
+    watch_items = []
+
+    buy_items = []
     buy_count = 0
 
     for sym, res in results:
         sig = res.get("signal", "")
         setup = res.get("setup", "")
-        score = res.get("score", 0)
+        score = int(res.get("score", 0) or 0)
         entry = res.get("entry", "")
         stop = res.get("stop", "")
         reason = res.get("reason", "")
@@ -365,19 +366,34 @@ def main():
         if sig == "BUY_NOW":
             buy_count += 1
             line = f"{sym} – BUY NOW – Setup: {setup} – Entry: {entry} – Stop: {stop} – Reason: {reason}"
-            buy_rows.append([line, sym, setup, score, entry, stop, reason, now_utc])
+            buy_items.append((score, [line, sym, setup, score, entry, stop, reason, now_utc]))
 
+        if sig == "WATCH":
+            watch_items.append((score, [sym, setup, score, entry, stop, reason, now_utc]))
+
+    # Full list
     ws_signals.clear()
     ws_signals.update("A1", rows)
 
+    # BUY_NOW shortlist (sorted by score, highest first)
+    buy_items.sort(key=lambda x: x[0], reverse=True)
+    buy_rows.extend([row for _, row in buy_items])
     ws_buys.clear()
     ws_buys.update("A1", buy_rows)
 
+    # WATCH shortlist (sorted by score, highest first)
+    watch_items.sort(key=lambda x: x[0], reverse=True)
+    watch_rows = [watch_header] + [row for _, row in watch_items]
+    ws_watch.clear()
+    ws_watch.update("A1", watch_rows)
+
+    # Run log
     ensure_run_log_header(ws_log)
     ws_log.append_row([now_utc, len(tickers), buy_count, errors, api_calls, credits_est, "ok"], value_input_option="USER_ENTERED")
 
+    # Console output
     print("BUY_NOW signals:")
-    for r in buy_rows[1:]:
+    for _, r in buy_items:
         print(r[0])
     print(f"Done. tickers={len(tickers)} buy_now={buy_count} errors={errors} api_calls={api_calls} credits_est={credits_est}")
 
