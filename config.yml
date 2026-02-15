@@ -21,13 +21,16 @@ indicators:
   sma_slow: 200
   atr_len: 14
 
+# Keep for reference, but default disabled so you have exactly 3 setups in output.
 setup_base_breakout:
+  enabled: false
   base_lookback: 30
   base_max_depth_pct: 15
   breakout_buffer_pct: 0.2
   vol_multiplier: 1.2
   atr_stop_mult: 2.0
 
+# Qullamaggie (daily-only) with your loosened settings
 setup_qullamaggie_breakout:
   enabled: true
 
@@ -62,3 +65,35 @@ setup_qullamaggie_breakout:
   # Stop constraint: (entry - LOD) must be <= ATR14 * this
   stop_max_atr_mult: 1.2
 
+# Minervini shared filter (applies to both Minervini setups)
+minervini:
+  enabled: true
+
+  # Trend Template (deterministic)
+  min_above_52w_low_mult: 1.3
+
+  # Optional RS proxy within scanned list
+  rs_enabled: true
+  rs_top_pct: 20
+  rs_windows: [63, 126]
+
+# Minervini Setup 1: VCP Breakout
+setup_minervini_vcp:
+  enabled: true
+  vcp_lookback: 50
+  vcp_final_range_max_pct: 10.0
+  vcp_vol_dryup_mult: 0.8
+  breakout_buffer_pct: 0.10
+  vcp_breakout_vol_mult: 1.5
+  atr_stop_mult: 2.0
+
+# Minervini Setup 2: 3-Week Tight Breakout
+setup_minervini_3wt:
+  enabled: true
+  twt_bars: 15
+  twt_max_range_pct: 8.0
+  twt_week_close_pos: 0.6
+  breakout_buffer_pct: 0.10
+  vol_confirm_enabled: true
+  twt_breakout_vol_mult: 1.2
+  atr_stop_mult: 2.0
