@@ -1,0 +1,22 @@
+api:
+  interval: "1day"
+  outputsize: 260
+  batch_size: 8
+  max_requests_per_min: 8
+
+filters:
+  min_dollar_vol_50d: 10000000
+  near_52w_high_pct: 10
+
+indicators:
+  sma_fast: 50
+  sma_mid: 150
+  sma_slow: 200
+  atr_len: 14
+
+setup_base_breakout:
+  base_lookback: 30
+  base_max_depth_pct: 15
+  breakout_buffer_pct: 0.2
+  vol_multiplier: 1.2
+  atr_stop_mult: 2.0
