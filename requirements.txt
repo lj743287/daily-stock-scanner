@@ -1,0 +1,6 @@
+requests==2.31.0
+pandas==2.2.2
+numpy==1.26.4
+PyYAML==6.0.2
+gspread==6.1.2
+google-auth==2.33.0
