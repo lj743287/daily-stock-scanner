@@ -30,7 +30,6 @@ def parse_symbols_from_text(text: str) -> list[str]:
     if not text:
         return []
 
-    # Split by newlines first, then by commas
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -48,11 +47,9 @@ def parse_symbols_from_text(text: str) -> list[str]:
                 left_u = left.strip().upper()
                 right_u = right.strip().upper()
 
-                # TradingView style: EXCHANGE:TICKER -> swap
                 if left_u in known_exchanges and right_u:
                     sym = f"{right_u}:{left_u}"
                 else:
-                    # Already TICKER:EXCHANGE or something else
                     sym = p.strip().upper()
             else:
                 sym = p.strip().upper()
@@ -86,16 +83,14 @@ def read_tickers_from_sheet(sh) -> list[str]:
     if not values:
         return []
 
-    # If A2 has a big export string, use that
     a2 = values[1].strip() if len(values) >= 2 and values[1] else ""
     if a2:
         return parse_symbols_from_text(a2)
 
-    # Otherwise treat A2.. as a list of tickers
     lines = []
     for i, v in enumerate(values):
         if i == 0:
-            continue  # skip header row (A1)
+            continue
         v = (v or "").strip()
         if not v:
             continue
@@ -124,7 +119,6 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
         "format": "JSON",
     }
 
-    # Simple retry on rate limiting
     for attempt in range(2):
         r = requests.get(TD_BASE, params=params, timeout=30)
         if r.status_code == 429 and attempt == 0:
@@ -345,7 +339,10 @@ def main():
     with open("config.yml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    # Open the Google Sheet early so we can read tickers from it
+    max_tickers_per_run = int(cfg.get("api", {}).get("max_tickers_per_run", 300))
+    if max_tickers_per_run < 1:
+        max_tickers_per_run = 300
+
     gc = get_gspread_client(sa_json)
     sh = gc.open_by_key(sheet_id)
 
@@ -357,6 +354,12 @@ def main():
 
     if not tickers:
         raise SystemExit("No tickers found (Tickers tab empty and tickers.txt empty)")
+
+    total_before_cap = len(tickers)
+    capped = False
+    if total_before_cap > max_tickers_per_run:
+        tickers = tickers[:max_tickers_per_run]
+        capped = True
 
     interval = cfg.get("api", {}).get("interval", "1day")
     outputsize = int(cfg.get("api", {}).get("outputsize", 260))
@@ -460,15 +463,20 @@ def main():
     ws_watch.update("A1", watch_rows)
 
     ensure_run_log_header(ws_log)
+
+    note = f"ok ({tickers_source})"
+    if capped:
+        note = f"ok ({tickers_source}) capped {len(tickers)} of {total_before_cap}"
+
     ws_log.append_row(
-        [now_utc, len(tickers), buy_count, errors, api_calls, credits_est, f"ok ({tickers_source})"],
+        [now_utc, len(tickers), buy_count, errors, api_calls, credits_est, note],
         value_input_option="USER_ENTERED",
     )
 
     print("BUY_NOW signals:")
     for _, r in buy_items:
         print(r[0])
-    print(f"Done. tickers={len(tickers)} buy_now={buy_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source}")
+    print(f"Done. tickers={len(tickers)} buy_now={buy_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source} capped={capped}")
 
 
 if __name__ == "__main__":
