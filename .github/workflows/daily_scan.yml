@@ -3,21 +3,26 @@ name: Daily Stock Scanner
 on:
   workflow_dispatch:
   schedule:
-    - cron: "35 21 * * 1-5"
+    # Runs at 21:30 UTC, Monday to Friday.
+    # This is safely after the US market close in both summer and winter time.
+    - cron: "30 21 * * 1-5"
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run scanner
