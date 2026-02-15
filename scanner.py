@@ -253,6 +253,45 @@ def pick_best(results: list[dict]) -> dict:
     return best or {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": ""}
 
 
+def build_debug_summary(setup_results: list[dict], chosen_setup: str) -> str:
+    """
+    Creates a concise string describing other setups that were close:
+      - WATCH setups (pattern ok but no breakout yet)
+      - PASS setups with late-stage failures (eg volume confirm, stop too wide)
+    """
+    items = []
+    for r in setup_results:
+        if not r:
+            continue
+        setup = (r.get("setup") or "").strip()
+        sig = (r.get("signal") or "").strip()
+        reason = (r.get("reason") or "").strip()
+
+        if not setup or setup == chosen_setup:
+            continue
+
+        # Include WATCH always as "close"
+        if sig == "WATCH":
+            items.append(f"{setup}: WATCH ({reason})")
+            continue
+
+        # Include late-stage PASS reasons
+        late_markers = (
+            "breakout fail",
+            "Stop too wide",
+            "LOD rule fails",
+            "Invalid stop",
+            "volume not strong enough",
+        )
+        if sig == "PASS" and any(m.lower() in reason.lower() for m in late_markers):
+            items.append(f"{setup}: {reason}")
+
+    # Keep it short
+    if not items:
+        return ""
+    return " | ".join(items[:3])
+
+
 def eval_base_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> dict:
     out = {"signal": "PASS", "setup": "Base Breakout", "score": 0, "entry": "", "stop": "", "reason": ""}
 
@@ -783,7 +822,7 @@ def eval_minervini_3wt(df: pd.DataFrame, cfg: dict, last: pd.Series, rs_ok: bool
 
 def analyse_symbol(df: pd.DataFrame, cfg: dict, qull_leader_ok: bool, min_rs_ok: bool) -> dict:
     if df.empty or len(df) < 260:
-        return {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": "Not enough daily data"}
+        return {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": "Not enough daily data", "debug": ""}
 
     ema10_len = int(cfg.get("indicators", {}).get("ema_fast", 10))
     ema20_len = int(cfg.get("indicators", {}).get("ema_mid", 20))
@@ -806,15 +845,17 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict, qull_leader_ok: bool, min_rs_ok:
 
     last = df.iloc[-1]
 
-    # Evaluate setups (exactly 3 primary setups, plus Base Breakout if enabled)
-    setups = [
+    setup_results = [
         eval_qullamaggie_breakout(df, cfg, last, qull_leader_ok),
         eval_minervini_vcp(df, cfg, last, min_rs_ok),
         eval_minervini_3wt(df, cfg, last, min_rs_ok),
         eval_base_breakout(df, cfg, last),
     ]
 
-    return pick_best(setups)
+    best = pick_best(setup_results)
+    best_setup = (best.get("setup") or "").strip()
+    best["debug"] = build_debug_summary(setup_results, best_setup)
+    return best
 
 
 def get_gspread_client(sa_json_text: str):
@@ -905,32 +946,24 @@ def main():
             data = fetch_time_series_batch(td_key, sym_batch, interval, outputsize)
             api_calls += 1
 
-            # Single-symbol response shape: {"values":[...], ...}
-            if isinstance(data, dict) and "values" in data and not any(k in data for k in ["meta", "AAPL", "MSFT"]):
-                # Fallback: if TwelveData returns a single payload even when multiple requested,
-                # only the first symbol will be processed from this response.
+            # Multi-symbol response shape: { "AAPL": {...}, "MSFT": {...}, ... }
+            if isinstance(data, dict) and "values" not in data:
+                for sym in sym_batch:
+                    payload = data.get(sym, {}) or {}
+                    df = normalise_timeseries_payload(sym, payload)
+                    df_map[sym] = df
+                    if df.empty:
+                        err_map[sym] = payload.get("message", "No data")
+            else:
+                # Single-symbol response shape: {"values":[...], ...}
                 sym = sym_batch[0]
                 df = normalise_timeseries_payload(sym, data)
                 df_map[sym] = df
                 if df.empty:
                     err_map[sym] = data.get("message", "No data")
-                # Mark the rest as missing
                 for other in sym_batch[1:]:
                     df_map[other] = pd.DataFrame()
                     err_map[other] = "No data (batch response mismatch)"
-            else:
-                # Multi-symbol response shape: { "AAPL": {...}, "MSFT": {...}, ... }
-                for sym in sym_batch:
-                    payload = {}
-                    if isinstance(data, dict):
-                        payload = data.get(sym, {}) or {}
-                    df = normalise_timeseries_payload(sym, payload)
-                    df_map[sym] = df
-                    if df.empty:
-                        msg = payload.get("message")
-                        if not msg and isinstance(data, dict):
-                            msg = data.get("message")
-                        err_map[sym] = msg or "No data"
 
         except Exception as e:
             for sym in sym_batch:
@@ -962,20 +995,21 @@ def main():
     for sym in tickers:
         df = df_map.get(sym, pd.DataFrame())
         if df is None or df.empty:
-            results.append((sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": err_map.get(sym, "No data")}))
+            results.append((sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": err_map.get(sym, "No data"), "debug": ""}))
             continue
         res = analyse_symbol(df, cfg, qull_flags.get(sym, False), rs_flags.get(sym, True))
         results.append((sym, res))
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    ws_signals = upsert_worksheet(sh, "Signals", rows=max(1000, len(results) + 10), cols=12)
+    # Signals now has one extra column -> set cols >= 13
+    ws_signals = upsert_worksheet(sh, "Signals", rows=max(1000, len(results) + 10), cols=14)
     ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=500, cols=12)
     ws_watch = upsert_worksheet(sh, "WATCH", rows=1000, cols=12)
     ws_summary = upsert_worksheet(sh, "Summary", rows=50, cols=4)
     ws_log = upsert_worksheet(sh, "Run_Log", rows=1000, cols=12)
 
-    header = ["ticker", "signal", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
+    header = ["ticker", "signal", "setup", "score", "entry", "stop", "reason", "debug", "as_of_utc"]
     rows = [header]
 
     buy_header = ["line", "ticker", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
@@ -995,8 +1029,9 @@ def main():
         entry = res.get("entry", "")
         stop = res.get("stop", "")
         reason = res.get("reason", "")
+        debug = res.get("debug", "")
 
-        rows.append([sym, sig, setup, score, entry, stop, reason, now_utc])
+        rows.append([sym, sig, setup, score, entry, stop, reason, debug, now_utc])
 
         sym_disp = display_ticker(sym)
 
