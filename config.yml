@@ -1,8 +1,8 @@
 api:
   interval: 1day
   outputsize: 260
-  # Increase this if you want faster runs; batching is only to avoid request/URL-size issues.
-  batch_size: 50
+  batch_size: 55
+  max_api_credits_per_min: 55
 
 indicators:
   ema_fast: 10
@@ -16,45 +16,136 @@ indicators:
 filters:
   near_52w_high_pct: 25
 
+# 1) Qullamaggie Base Breakout (proper base)
 setup_qullamaggie_breakout:
   enabled: true
   impulse_lookback: 60
   impulse_min_pct: 30
+
+  # Base window (ends yesterday)
   cons_min_bars: 10
   cons_max_bars: 40
+
+  # You asked to remove the fixed depth requirement (range not too wide), so this is OFF by default
+  enforce_depth: false
   cons_max_depth_pct: 15
+
+  # Keep it from being a runaway trend (should base/pull back and then tighten)
   cons_max_up_drift_pct: 10
-  cons_max_down_drift_pct: 15
+  cons_max_down_drift_pct: 10
+  cons_low_must_be_early_pct: 0.60
+  tightening_ratio_max: 0.90
   higher_low_tol_pct: 2
-  pivot_exclude_last_n: 2
-  breakout_buffer_pct: 0.2
+
+  # Surfing MA logic (support on 10/20/50)
   surf_close_min_pct: 70
   surf_max_dist_pct: 6
   ma_slope_lookback: 5
+
+  # NEW: require actual MA interaction (touches) to stop false positives
+  surf_touch_min_count: 2
+  surf_touch_tol_pct: 1.0
+
+  breakout_buffer_pct: 0.2
+  pivot_exclude_last_n: 2
+
+  # Extended / risk sanity
   max_ext_pct_above_surf_ma: 8
   max_ext_atr_mult_above_surf_ma: 3
   max_breakout_extension_pct: 4
   stop_width_atr_mult: 1.0
 
+# 2) Qullamaggie Staircase Pullback
+setup_qullamaggie_staircase:
+  enabled: true
+
+  # Pullback window (ends yesterday)
+  pullback_min_bars: 3
+  pullback_max_bars: 12
+
+  # Impulse leg definition
+  impulse_lookback: 25
+  impulse_min_pct: 15
+  peak_lookback: 5
+
+  # Your rule: must not retrace deeper than 78.6% of the impulse
+  fib_retrace_max: 0.786
+
+  # Controlled pullback (not a wild chop) - adjust if too strict
+  pullback_max_range_pct: 10
+  pullback_max_drift_pct: 6
+
+  # Surfing MA (EMA10/EMA20)
+  surf_close_min_pct: 60
+  surf_touch_min_count: 1
+  surf_touch_tol_pct: 1.0
+
+  breakout_buffer_pct: 0.2
+  pivot_exclude_last_n: 2
+
+  # Extended / risk sanity
+  max_breakout_extension_pct: 4
+  max_ext_pct_above_surf_ma: 10
+  max_ext_atr_mult_above_surf_ma: 4
+  stop_width_atr_mult: 1.2
+
+# B) Minervini VCP (Volatility Contraction Pattern) - revised logic
 setup_minervini_vcp:
   enabled: true
-  lookback_bars: 65
-  pivot_exclude_last_n: 5
-  vcp_max_depth_pct: 35
-  vcp_ratio_12: 0.90
-  vcp_ratio_23: 0.90
-  vol_dryup_mult: 0.85
+
+  # Base length (weeks)
+  base_weeks_min: 3
+  base_weeks_max: 60
+  base_weeks_pref_min: 6
+  base_weeks_pref_max: 12
+
+  # Left-side high logic
+  left_side_max_pos_pct: 0.25
+  left_high_overshoot_tol_pct: 1.0
+
+  # Pivots (swings) used for contractions
+  pivot_left_bars: 5
+  pivot_right_bars: 5
+
+  # Contractions
+  contractions_min: 2
+  contractions_max: 6
+  contractions_pref_min: 3
+  contractions_pref_max: 4
+
+  # You changed this from 35% to 50%
+  max_base_depth_pct: 50
+
+  # Depth contraction rule (messy but directional)
+  depth_shrink_mult: 0.85
+  depth_shrink_min_steps_frac: 0.60
+  depth_allow_one_bump_pct: 20
+  d_last_vs_first_mult: 0.60
+  d_last_max_pct: 12
+
+  # Prevent "it's just going up" (needs meaningful pullbacks)
+  meaningful_pullback_min_pct: 6
+
+  # Tightening rules
+  atrp_compress_req: 0.80
+  atrp_compress_pref: 0.70
+  right_segment_bars_min: 10
+  right_segment_bars_max: 20
+  right_range_max_pct: 8
+  right_close_top_half_min_pct: 60
+
+  # Entry / WATCH
   breakout_buffer_pct: 0.2
   near_breakout_pct: 3
+  pivot_lookback_bars: 15
+  pivot_exclude_last_n: 5
+
+  # Extended filters
   max_breakout_extension_pct: 4
   max_ext_above_sma50_pct: 12
 
-setup_minervini_3wt:
-  enabled: true
-  bars: 15
-  max_range_pct: 8
-  max_drift_pct: 8
-  breakout_buffer_pct: 0.2
-  near_breakout_pct: 3
-  max_breakout_extension_pct: 4
-  max_ext_above_sma50_pct: 12
+  # Scoring bonus (optional)
+  vol_dryup_mult: 0.85
+
+  # Fail filter: right-side volatility expansion
+  right_vol_expand_bump_pct: 20
