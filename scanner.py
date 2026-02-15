@@ -89,12 +89,10 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = "Not enough daily data"
         return out
 
-    # EMA lengths (defaults if not in config)
     ema10_len = int(cfg.get("indicators", {}).get("ema_fast", 10))
     ema20_len = int(cfg.get("indicators", {}).get("ema_mid", 20))
     ema50_len = int(cfg.get("indicators", {}).get("ema_slow", 50))
 
-    # 200MA length + ATR length (defaults if not in config)
     sma200_len = int(cfg.get("indicators", {}).get("sma_slow", 200))
     atr_len = int(cfg.get("indicators", {}).get("atr_len", 14))
 
@@ -115,23 +113,19 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     last = df.iloc[-1]
     idx_last = df.index[-1]
 
-    # 52-week high check
     high_52w = df["high"].rolling(252).max().iloc[-1]
     near_pct = float(cfg.get("filters", {}).get("near_52w_high_pct", 25))
     near_52w_ok = last["close"] >= (1 - near_pct / 100.0) * high_52w
 
-    # Liquidity check (50-day average close*volume)
     min_dv = float(cfg.get("filters", {}).get("min_dollar_vol_50d", 10000000))
     dv50 = df["dollar_vol"].rolling(50).mean().iloc[-1]
     liquidity_ok = dv50 >= min_dv
 
-    # 200MA rising check (today > 20 trading days ago)
     if idx_last - 20 >= 0:
         sma200_up = df["sma200"].iloc[-1] > df["sma200"].iloc[-21]
     else:
         sma200_up = False
 
-    # NEW MA rule: 10EMA > 20EMA > 50EMA
     ema_stack_ok = (last["ema10"] > last["ema20"] > last["ema50"])
 
     trend_ok = (ema_stack_ok and sma200_up and near_52w_ok and liquidity_ok)
@@ -149,7 +143,6 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = "Trend fail: " + ", ".join(fails)
         return out
 
-    # Base Breakout setup
     base_cfg = cfg.get("setup_base_breakout", {})
     base_n = int(base_cfg.get("base_lookback", 30))
     base_max_depth_pct = float(base_cfg.get("base_max_depth_pct", 15))
@@ -180,12 +173,21 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         if not np.isnan(base_vol_avg) and base_vol_avg > 0 and not np.isnan(last.get("volume", np.nan)):
             vol_ok = last["volume"] >= base_vol_avg * vol_mult
 
+    # Planned stop (we can use it for WATCH as well)
+    atr_val = last.get("atr", np.nan)
+    stop_atr = entry - (atr_stop_mult * atr_val) if not np.isnan(atr_val) else base_low
+    stop_swing = base_low
+    stop = max(stop_swing, stop_atr)
+    if stop >= entry:
+        stop = stop_swing
+
     if not tight_ok:
         out["signal"] = "WATCH"
         out["setup"] = "Base Breakout"
         out["reason"] = "Trend ok, but base not tight"
         out["score"] = 55
         out["entry"] = f"{entry:.2f}"
+        out["stop"] = f"{stop:.2f}"
         return out
 
     if not breakout_ok:
@@ -194,14 +196,8 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = "Trend ok, tight base, no breakout yet"
         out["score"] = 70
         out["entry"] = f"{entry:.2f}"
+        out["stop"] = f"{stop:.2f}"
         return out
-
-    atr_val = last.get("atr", np.nan)
-    stop_atr = entry - (atr_stop_mult * atr_val) if not np.isnan(atr_val) else base_low
-    stop_swing = base_low
-    stop = max(stop_swing, stop_atr)
-    if stop >= entry:
-        stop = stop_swing
 
     score = 40 + 30 + (10 if vol_ok else 0)
     tight_bonus = int(max(0, min(20, (base_max_depth_pct - depth_pct) * 1.5)))
