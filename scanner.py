@@ -178,7 +178,6 @@ def compute_sma(series: pd.Series, length: int) -> pd.Series:
 
 
 def compute_return(df: pd.DataFrame, lookback: int) -> float:
-    # Total return close(today)/close(N days ago) - 1
     if df is None or df.empty:
         return np.nan
     if len(df) < lookback + 2:
@@ -194,7 +193,7 @@ def compute_percentile_flags(df_map: dict[str, pd.DataFrame], windows: list[int]
     """
     Flags symbols that are in the top X% by return for ANY of the windows.
     Percentiles are computed within the scanned list (df_map).
-    If too few symbols have valid returns, this filter is effectively disabled (all False).
+    If too few symbols have valid returns, thresholds become +inf (no one qualifies).
     """
     windows = [int(w) for w in windows]
     top_pct = float(top_pct)
@@ -235,32 +234,28 @@ def compute_percentile_flags(df_map: dict[str, pd.DataFrame], windows: list[int]
 def pick_best(results: list[dict]) -> dict:
     # Prefer BUY_NOW > WATCH > PASS, then higher score
     rank = {"PASS": 0, "WATCH": 1, "BUY_NOW": 2}
-
     best = None
+
     for r in results:
         if not r:
             continue
         if best is None:
             best = r
             continue
-        if rank.get(r.get("signal", "PASS"), 0) > rank.get(best.get("signal", "PASS"), 0):
+
+        r_rank = rank.get(r.get("signal", "PASS"), 0)
+        b_rank = rank.get(best.get("signal", "PASS"), 0)
+
+        if r_rank > b_rank:
             best = r
             continue
-        if rank.get(r.get("signal", "PASS"), 0) == rank.get(best.get("signal", "PASS"), 0):
-            if int(r.get("score", 0) or 0) > int(best.get("score", 0) or 0):
-                best = r
+        if r_rank == b_rank and int(r.get("score", 0) or 0) > int(best.get("score", 0) or 0):
+            best = r
 
     return best or {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": ""}
 
 
 def build_debug_summary(setup_results: list[dict], chosen_setup: str, max_items: int = 3) -> str:
-    """
-    Creates a concise string describing other setups:
-      - WATCH setups (pattern ok but no breakout yet)
-      - PASS setups with late-stage failures (eg volume confirm, stop too wide)
-      - PASS setups with early-stage failures (trend fail, leader fail, pattern fail)
-    Priority: WATCH -> late-stage PASS -> early-stage PASS
-    """
     watch_items: list[str] = []
     late_items: list[str] = []
     early_items: list[str] = []
@@ -272,7 +267,6 @@ def build_debug_summary(setup_results: list[dict], chosen_setup: str, max_items:
             "lod rule fails",
             "invalid stop",
             "volume not strong enough",
-            "volume unavailable",
         )
         r = (reason or "").lower()
         return any(m in r for m in markers)
@@ -280,7 +274,7 @@ def build_debug_summary(setup_results: list[dict], chosen_setup: str, max_items:
     def is_early_failure(reason: str) -> bool:
         markers = (
             "trend fail",
-            "not a momentum leader",
+            "atr unavailable",
             "atr% too low",
             "no valid",
             "vcp fail",
@@ -289,6 +283,8 @@ def build_debug_summary(setup_results: list[dict], chosen_setup: str, max_items:
             "window too small",
             "segments too small",
             "invalid price data",
+            "volume unavailable",
+            "no valid ma-surf",
         )
         r = (reason or "").lower()
         return any(m in r for m in markers)
@@ -302,8 +298,6 @@ def build_debug_summary(setup_results: list[dict], chosen_setup: str, max_items:
 
         if not setup or setup == chosen_setup:
             continue
-
-        # Skip noise
         if reason.lower() in {"setup disabled", "disabled"}:
             continue
 
@@ -344,7 +338,7 @@ def eval_base_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> dict:
 
     if len(df) < base_n + 2:
         out["signal"] = "WATCH"
-        out["reason"] = "Trend ok, base window too small"
+        out["reason"] = "Base window too small"
         out["score"] = 40
         return out
 
@@ -373,7 +367,7 @@ def eval_base_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> dict:
 
     if not tight_ok:
         out["signal"] = "WATCH"
-        out["reason"] = "Trend ok, but base not tight"
+        out["reason"] = "Base not tight"
         out["score"] = 55
         out["entry"] = f"{entry:.2f}"
         out["stop"] = f"{stop:.2f}"
@@ -381,7 +375,7 @@ def eval_base_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> dict:
 
     if not breakout_ok:
         out["signal"] = "WATCH"
-        out["reason"] = "Trend ok, tight base, no breakout yet"
+        out["reason"] = "Tight base, no breakout yet"
         out["score"] = 70
         out["entry"] = f"{entry:.2f}"
         out["stop"] = f"{stop:.2f}"
@@ -395,20 +389,28 @@ def eval_base_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> dict:
     out["score"] = score
     out["entry"] = f"{entry:.2f}"
     out["stop"] = f"{stop:.2f}"
-    out["reason"] = "Trend up, tight base, broke pivot" + (", volume ok" if vol_ok else ", volume weak")
+    out["reason"] = "Tight base, broke pivot" + (", volume ok" if vol_ok else ", volume weak")
     return out
 
 
-def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, leader_ok: bool) -> dict:
+def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> dict:
+    """
+    Qullamaggie Breakout (daily-only):
+      - Impulse leg within lookback: impulse_min_pct rise from swing low to swing high
+      - Consolidation 2-9-ish weeks:
+          - depth <= cons_depth_max_pct
+          - higher lows (last third low > first third low)
+          - surfing: % closes above EMA20 >= surf_pct
+          - EMA10 and EMA20 rising into end of consolidation (yesterday vs N days ago)
+      - Entry: break above consolidation high + buffer
+      - Stop on breakout day: Low of Day; must not exceed ATR * stop_max_atr_mult
+    Momentum leader filter is REMOVED (you will screen that).
+    """
     out = {"signal": "PASS", "setup": "Qullamaggie Breakout", "score": 0, "entry": "", "stop": "", "reason": ""}
 
     qcfg = cfg.get("setup_qullamaggie_breakout", {}) or {}
     if not bool(qcfg.get("enabled", True)):
         out["reason"] = "Setup disabled"
-        return out
-
-    if not leader_ok:
-        out["reason"] = "Not a momentum leader (top percentile in 1/3/6M within scan list)"
         return out
 
     atr_val = last.get("atr", np.nan)
@@ -430,7 +432,7 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, lead
     cons_max = int(qcfg.get("cons_max_bars", 45))
     cons_depth_max_pct = float(qcfg.get("cons_depth_max_pct", 25.0))
 
-    surf_pct = float(qcfg.get("surf_close_above_sma20_pct", 0.6))
+    surf_pct = float(qcfg.get("surf_close_above_ema20_pct", qcfg.get("surf_close_above_sma20_pct", 0.6)))
     ma_rise_lookback = int(qcfg.get("ma_rise_lookback", 3))
 
     breakout_buffer_pct = float(qcfg.get("breakout_buffer_pct", 0.05))
@@ -439,87 +441,100 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, lead
     stop_max_atr_mult = float(qcfg.get("stop_max_atr_mult", 1.2))
 
     best = None
+    fail_counts = {"depth": 0, "higher_lows": 0, "surf": 0, "ma_rise": 0, "impulse": 0, "pullback": 0, "data": 0}
 
-    # Exclude today from consolidation; today is breakout-check day
     for cons_len in range(cons_min, cons_max + 1):
         need = cons_len + impulse_lookback + 2
         if len(df) < need:
+            fail_counts["data"] += 1
             continue
 
         cons = df.iloc[-(cons_len + 1):-1]
         if cons.empty:
+            fail_counts["data"] += 1
             continue
 
         cons_high = cons["high"].max()
         cons_low = cons["low"].min()
         if not cons_high or cons_high <= 0:
+            fail_counts["data"] += 1
             continue
 
         depth_pct = 100.0 * (cons_high - cons_low) / cons_high
         if depth_pct > cons_depth_max_pct:
+            fail_counts["depth"] += 1
             continue
 
-        # Higher lows: last third low > first third low
         n = len(cons)
         one_third = max(1, n // 3)
         early = cons.iloc[:one_third]
         late = cons.iloc[-one_third:]
         if late["low"].min() <= early["low"].min():
+            fail_counts["higher_lows"] += 1
             continue
 
-        # Surfing: % of closes above SMA20
-        if "sma20" not in cons.columns or cons["sma20"].isna().all():
+        # Surfing: closes above EMA20
+        if "ema20" not in cons.columns or cons["ema20"].isna().all():
+            fail_counts["data"] += 1
             continue
-        frac_above = float((cons["close"] >= cons["sma20"]).mean())
+        frac_above = float((cons["close"] >= cons["ema20"]).mean())
         if frac_above < surf_pct:
+            fail_counts["surf"] += 1
             continue
 
-        # 10/20 rising into the end of consolidation (yesterday vs N days ago)
+        # EMA10/EMA20 rising into end of consolidation (yesterday vs N days ago)
         idx_end = len(df) - 2
         idx_prev = idx_end - ma_rise_lookback
         if idx_prev < 0:
+            fail_counts["data"] += 1
             continue
-        if df["sma10"].iloc[idx_end] <= df["sma10"].iloc[idx_prev]:
+        if df["ema10"].iloc[idx_end] <= df["ema10"].iloc[idx_prev]:
+            fail_counts["ma_rise"] += 1
             continue
-        if df["sma20"].iloc[idx_end] <= df["sma20"].iloc[idx_prev]:
+        if df["ema20"].iloc[idx_end] <= df["ema20"].iloc[idx_prev]:
+            fail_counts["ma_rise"] += 1
             continue
 
         # Impulse window immediately before consolidation
         pre = df.iloc[-(cons_len + impulse_lookback + 1):-(cons_len + 1)]
         if pre.empty:
+            fail_counts["data"] += 1
             continue
 
         low_idx = int(pre["low"].idxmin())
         high_idx = int(pre["high"].idxmax())
         if high_idx <= low_idx:
+            fail_counts["impulse"] += 1
             continue
 
         impulse_low = float(pre["low"].min())
         impulse_high = float(pre["high"].max())
         if impulse_low <= 0:
+            fail_counts["data"] += 1
             continue
 
         impulse_pct = 100.0 * (impulse_high / impulse_low - 1.0)
         if impulse_pct < impulse_min_pct:
+            fail_counts["impulse"] += 1
             continue
 
         # Pullback constraint: consolidation stays within X% of impulse high
         min_cons_high = impulse_high * (1.0 - pullback_from_impulse_high_pct / 100.0)
         if cons_high < min_cons_high:
+            fail_counts["pullback"] += 1
             continue
 
-        # Score: prefer tighter + better surf
         tight_bonus = int(max(0, min(25, (cons_depth_max_pct - depth_pct) * 1.5)))
         surf_bonus = int(max(0, min(10, (frac_above - surf_pct) * 20)))
         cand_score = 60 + tight_bonus + surf_bonus
 
         cand = {
             "cons_len": cons_len,
-            "cons_high": cons_high,
-            "cons_low": cons_low,
-            "depth_pct": depth_pct,
-            "frac_above": frac_above,
-            "impulse_pct": impulse_pct,
+            "cons_high": float(cons_high),
+            "cons_low": float(cons_low),
+            "depth_pct": float(depth_pct),
+            "frac_above": float(frac_above),
+            "impulse_pct": float(impulse_pct),
             "score_base": int(min(85, cand_score)),
         }
 
@@ -527,14 +542,24 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, lead
             best = cand
 
     if best is None:
-        out["reason"] = "No valid MA-surf consolidation found"
+        # Deterministic "best guess" why we couldn't find a valid pattern
+        top_fail = max(fail_counts.items(), key=lambda kv: kv[1])[0]
+        reason_map = {
+            "depth": "consolidation too deep",
+            "higher_lows": "higher-lows test failed",
+            "surf": "not surfing EMA20 enough",
+            "ma_rise": "EMA10/EMA20 not rising",
+            "impulse": "impulse leg rule not met",
+            "pullback": "pullback too deep vs impulse high",
+            "data": "insufficient/invalid data in windows",
+        }
+        out["reason"] = "No valid MA-surf consolidation found (" + reason_map.get(top_fail, top_fail) + ")"
         return out
 
     pivot = best["cons_high"]
     entry = pivot * (1 + breakout_buffer_pct / 100.0)
     breakout_ok = last["close"] > entry
 
-    # Range/volume expansion (scoring only)
     prev_close = df["close"].iloc[-2]
     tr_today = max(
         abs(last["high"] - last["low"]),
@@ -543,23 +568,20 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, lead
     )
     cons = df.iloc[-(best["cons_len"] + 1):-1]
     tr_cons = (cons["high"] - cons["low"]).abs().mean() if not cons.empty else np.nan
-    tr_ok = (not np.isnan(tr_cons)) and tr_today >= tr_cons * float(qcfg.get("tr_multiplier", 1.1))
+    tr_ok = (not np.isnan(tr_cons)) and tr_today >= tr_cons * tr_mult
 
     vol_ok = True
     if "volume" in df.columns and df["volume"].notna().any():
         cons_vol = cons["volume"].mean()
         if not np.isnan(cons_vol) and cons_vol > 0 and not np.isnan(last.get("volume", np.nan)):
-            vol_ok = last["volume"] >= cons_vol * float(qcfg.get("vol_multiplier", 1.1))
+            vol_ok = last["volume"] >= cons_vol * vol_mult
 
     if not breakout_ok:
         out["signal"] = "WATCH"
         out["entry"] = f"{entry:.2f}"
         out["stop"] = f"{best['cons_low']:.2f}"
         out["score"] = int(min(100, best["score_base"]))
-        out["reason"] = (
-            f"Leader ok, impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d MA-surf, no breakout yet; "
-            "stop on entry is LOD and must be <= ATR-multiple"
-        )
+        out["reason"] = f"Impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d MA-surf (EMA20), no breakout yet"
         return out
 
     # Breakout day stop rule: LOD, with ATR width constraint
@@ -586,7 +608,7 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, lead
     out["entry"] = f"{entry:.2f}"
     out["stop"] = f"{stop:.2f}"
     out["reason"] = (
-        f"Leader ok, impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d MA-surf, broke range"
+        f"Impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d MA-surf (EMA20), broke range"
         + (", volume ok" if vol_ok else ", volume weak")
         + (", range expanded" if tr_ok else "")
     )
@@ -594,6 +616,15 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, lead
 
 
 def minervini_trend_template_ok(df: pd.DataFrame, cfg: dict, last: pd.Series, rs_ok: bool) -> tuple[bool, str]:
+    """
+    Deterministic Minervini Trend Template (strict):
+      - Close > SMA50
+      - SMA50 > SMA150 > SMA200
+      - SMA200 rising (today > 20 trading days ago)
+      - Near 52w high (uses filters.near_52w_high_pct)
+      - Off lows: close >= 52w low * min_above_52w_low_mult (default 1.3)
+      - Optional RS proxy (default OFF unless enabled in config)
+    """
     mcfg = cfg.get("minervini", {}) or {}
     if not bool(mcfg.get("enabled", True)):
         return False, "Minervini disabled"
@@ -626,7 +657,8 @@ def minervini_trend_template_ok(df: pd.DataFrame, cfg: dict, last: pd.Series, rs
     if not (last["close"] >= low_52w * min_above_low):
         fails.append("not far enough off 52w low")
 
-    rs_enabled = bool(mcfg.get("rs_enabled", True))
+    # Default RS proxy OFF unless explicitly enabled
+    rs_enabled = bool(mcfg.get("rs_enabled", False))
     if rs_enabled and not rs_ok:
         fails.append("RS proxy not strong (top percentile)")
 
@@ -730,8 +762,7 @@ def eval_minervini_vcp(df: pd.DataFrame, cfg: dict, last: pd.Series, rs_ok: bool
         out["reason"] = "VCP breakout fail: volume not strong enough"
         return out
 
-    score = 80
-    score += int(max(0, min(10, (final_max - r3) * 1.5)))
+    score = 80 + int(max(0, min(10, (final_max - r3) * 1.5)))
     score = int(min(100, score))
 
     out["signal"] = "BUY_NOW"
@@ -842,9 +873,15 @@ def eval_minervini_3wt(df: pd.DataFrame, cfg: dict, last: pd.Series, rs_ok: bool
     return out
 
 
-def analyse_symbol(df: pd.DataFrame, cfg: dict, qull_leader_ok: bool, min_rs_ok: bool) -> dict:
+def analyse_symbol(df: pd.DataFrame, cfg: dict, min_rs_ok: bool) -> tuple[dict, list[dict]]:
+    """
+    Returns:
+      - best_result: single 'winner' for Signals tab
+      - all_results: list of setup results (BUY_NOW/WATCH union across setups)
+    """
     if df.empty or len(df) < 260:
-        return {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": "Not enough daily data", "debug": ""}
+        res = {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": "Not enough daily data", "debug": ""}
+        return res, [res]
 
     ema10_len = int(cfg.get("indicators", {}).get("ema_fast", 10))
     ema20_len = int(cfg.get("indicators", {}).get("ema_mid", 20))
@@ -859,25 +896,23 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict, qull_leader_ok: bool, min_rs_ok:
     df["sma200"] = df["close"].rolling(sma200_len).mean()
     df["atr"] = compute_atr(df, atr_len)
 
-    # SMAs for Qullamaggie + Minervini
-    df["sma10"] = compute_sma(df["close"], 10)
-    df["sma20"] = compute_sma(df["close"], 20)
+    # Minervini SMAs
     df["sma50"] = compute_sma(df["close"], 50)
     df["sma150"] = compute_sma(df["close"], 150)
 
     last = df.iloc[-1]
 
-    setup_results = [
-        eval_qullamaggie_breakout(df, cfg, last, qull_leader_ok),
+    all_results = [
+        eval_qullamaggie_breakout(df, cfg, last),
         eval_minervini_vcp(df, cfg, last, min_rs_ok),
         eval_minervini_3wt(df, cfg, last, min_rs_ok),
         eval_base_breakout(df, cfg, last),
     ]
 
-    best = pick_best(setup_results)
+    best = pick_best(all_results)
     best_setup = (best.get("setup") or "").strip()
-    best["debug"] = build_debug_summary(setup_results, best_setup, max_items=3)
-    return best
+    best["debug"] = build_debug_summary(all_results, best_setup, max_items=3)
+    return best, all_results
 
 
 def get_gspread_client(sa_json_text: str):
@@ -968,7 +1003,6 @@ def main():
             data = fetch_time_series_batch(td_key, sym_batch, interval, outputsize)
             api_calls += 1
 
-            # Multi-symbol response shape: { "AAPL": {...}, "MSFT": {...}, ... }
             if isinstance(data, dict) and "values" not in data:
                 for sym in sym_batch:
                     payload = data.get(sym, {}) or {}
@@ -977,7 +1011,6 @@ def main():
                     if df.empty:
                         err_map[sym] = payload.get("message", "No data")
             else:
-                # Single-symbol response shape: {"values":[...], ...}
                 sym = sym_batch[0]
                 df = normalise_timeseries_payload(sym, data)
                 df_map[sym] = df
@@ -996,16 +1029,9 @@ def main():
         sleep_s = (batch_credits / max_credits_per_min) * 60.0
         time.sleep(sleep_s)
 
-    # Leader flags: Qullamaggie
-    qcfg = cfg.get("setup_qullamaggie_breakout", {}) or {}
-    q_windows = qcfg.get("momentum_windows", [21, 63, 126])
-    q_top = float(qcfg.get("leader_top_pct", 5))
-    q_windows = [int(x) for x in q_windows] if isinstance(q_windows, list) else [21, 63, 126]
-    qull_flags = compute_percentile_flags(df_map, q_windows, q_top)
-
-    # RS proxy flags: Minervini
+    # RS proxy flags: Minervini (default OFF unless enabled)
     mcfg = cfg.get("minervini", {}) or {}
-    rs_enabled = bool(mcfg.get("rs_enabled", True))
+    rs_enabled = bool(mcfg.get("rs_enabled", False))
     rs_flags = {sym: True for sym in df_map.keys()}
     if rs_enabled:
         rs_windows = mcfg.get("rs_windows", [63, 126])
@@ -1013,27 +1039,16 @@ def main():
         rs_windows = [int(x) for x in rs_windows] if isinstance(rs_windows, list) else [63, 126]
         rs_flags = compute_percentile_flags(df_map, rs_windows, rs_top)
 
-    results = []
-    for sym in tickers:
-        df = df_map.get(sym, pd.DataFrame())
-        if df is None or df.empty:
-            results.append(
-                (sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": err_map.get(sym, "No data"), "debug": ""})
-            )
-            continue
-        res = analyse_symbol(df, cfg, qull_flags.get(sym, False), rs_flags.get(sym, True))
-        results.append((sym, res))
-
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    ws_signals = upsert_worksheet(sh, "Signals", rows=max(1000, len(results) + 10), cols=14)
-    ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=500, cols=12)
-    ws_watch = upsert_worksheet(sh, "WATCH", rows=1000, cols=12)
+    ws_signals = upsert_worksheet(sh, "Signals", rows=max(1000, len(tickers) + 10), cols=14)
+    ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=1000, cols=12)
+    ws_watch = upsert_worksheet(sh, "WATCH", rows=2000, cols=12)
     ws_summary = upsert_worksheet(sh, "Summary", rows=50, cols=4)
     ws_log = upsert_worksheet(sh, "Run_Log", rows=1000, cols=12)
 
-    header = ["ticker", "signal", "setup", "score", "entry", "stop", "reason", "debug", "as_of_utc"]
-    rows = [header]
+    sig_header = ["ticker", "signal", "setup", "score", "entry", "stop", "reason", "debug", "as_of_utc"]
+    sig_rows = [sig_header]
 
     buy_header = ["line", "ticker", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
     buy_rows = [buy_header]
@@ -1041,36 +1056,53 @@ def main():
     watch_header = ["ticker", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
     watch_rows = [watch_header]
 
-    buy_count = 0
     buy_items = []
     watch_items = []
+    buy_tickers = set()
+    watch_tickers = set()
 
-    for sym, res in results:
-        sig = res.get("signal", "")
-        setup = res.get("setup", "")
-        score = int(res.get("score", 0) or 0)
-        entry = res.get("entry", "")
-        stop = res.get("stop", "")
-        reason = res.get("reason", "")
-        debug = res.get("debug", "")
-
-        rows.append([sym, sig, setup, score, entry, stop, reason, debug, now_utc])
-
+    for sym in tickers:
+        df = df_map.get(sym, pd.DataFrame())
         sym_disp = display_ticker(sym)
 
-        if sig == "BUY_NOW":
-            buy_count += 1
-            line = f"{sym_disp} – BUY NOW – Setup: {setup} – Entry: {entry} – Stop: {stop} – Reason: {reason}"
-            buy_items.append((score, [line, sym_disp, setup, score, entry, stop, reason, now_utc]))
+        if df is None or df.empty:
+            best = {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": err_map.get(sym, "No data"), "debug": ""}
+            all_res = [best]
+        else:
+            best, all_res = analyse_symbol(df, cfg, rs_flags.get(sym, True))
 
-        if sig == "WATCH":
-            watch_items.append((score, [sym_disp, setup, score, entry, stop, reason, now_utc]))
+        sig_rows.append([
+            sym,
+            best.get("signal", ""),
+            best.get("setup", ""),
+            int(best.get("score", 0) or 0),
+            best.get("entry", ""),
+            best.get("stop", ""),
+            best.get("reason", ""),
+            best.get("debug", ""),
+            now_utc,
+        ])
 
-    watch_count = len(watch_items)
-    pass_count = max(0, len(tickers) - buy_count - watch_count)
+        # BUY_NOW/WATCH as UNION of all setups
+        for r in all_res:
+            sig = (r.get("signal") or "").strip()
+            setup = (r.get("setup") or "").strip()
+            score = int(r.get("score", 0) or 0)
+            entry = r.get("entry", "")
+            stop = r.get("stop", "")
+            reason = r.get("reason", "")
+
+            if sig == "BUY_NOW":
+                buy_tickers.add(sym_disp)
+                line = f"{sym_disp} – BUY NOW – Setup: {setup} – Entry: {entry} – Stop: {stop} – Reason: {reason}"
+                buy_items.append((score, [line, sym_disp, setup, score, entry, stop, reason, now_utc]))
+
+            if sig == "WATCH":
+                watch_tickers.add(sym_disp)
+                watch_items.append((score, [sym_disp, setup, score, entry, stop, reason, now_utc]))
 
     ws_signals.clear()
-    ws_signals.update("A1", rows)
+    ws_signals.update("A1", sig_rows)
 
     buy_items.sort(key=lambda x: x[0], reverse=True)
     buy_rows.extend([row for _, row in buy_items])
@@ -1081,6 +1113,10 @@ def main():
     watch_rows.extend([row for _, row in watch_items])
     ws_watch.clear()
     ws_watch.update("A1", watch_rows)
+
+    buy_count = len(buy_tickers)
+    watch_count = len(watch_tickers)
+    pass_count = max(0, len(tickers) - len(buy_tickers.union(watch_tickers)))
 
     note = f"ok ({tickers_source})"
     if capped:
