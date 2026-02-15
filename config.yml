@@ -2,16 +2,14 @@ api:
   interval: 1day
   outputsize: 260
 
-  # Keep batch_size small on the free plan.
-  # Each symbol in a batch still costs 1 credit.
+  # Each symbol costs 1 credit, even in a batch.
   batch_size: 8
 
-  # OLD setting (the current code still reads this for sleeping)
-  max_requests_per_min: 8
-
-  # NEW setting (we will switch the code to use this next)
-  # Free Basic is 8 API credits per minute, and 800 per day.
+  # Free Basic is typically 8 API credits per minute.
   max_api_credits_per_min: 8
+
+  # Safety cap: never scan more than this many tickers per run
+  max_tickers_per_run: 300
 
 filters:
   near_52w_high_pct: 25
