@@ -78,6 +78,10 @@ def compute_atr(df: pd.DataFrame, length: int) -> pd.Series:
     return tr.rolling(length).mean()
 
 
+def compute_ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+
 def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     out = {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": ""}
 
@@ -85,14 +89,25 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = "Not enough daily data"
         return out
 
-    sma50 = df["close"].rolling(cfg["indicators"]["sma_fast"]).mean()
-    sma150 = df["close"].rolling(cfg["indicators"]["sma_mid"]).mean()
-    sma200 = df["close"].rolling(cfg["indicators"]["sma_slow"]).mean()
-    atr = compute_atr(df, cfg["indicators"]["atr_len"])
+    # EMA lengths (defaults if not in config)
+    ema10_len = int(cfg.get("indicators", {}).get("ema_fast", 10))
+    ema20_len = int(cfg.get("indicators", {}).get("ema_mid", 20))
+    ema50_len = int(cfg.get("indicators", {}).get("ema_slow", 50))
+
+    # 200MA length + ATR length (defaults if not in config)
+    sma200_len = int(cfg.get("indicators", {}).get("sma_slow", 200))
+    atr_len = int(cfg.get("indicators", {}).get("atr_len", 14))
+
+    ema10 = compute_ema(df["close"], ema10_len)
+    ema20 = compute_ema(df["close"], ema20_len)
+    ema50 = compute_ema(df["close"], ema50_len)
+    sma200 = df["close"].rolling(sma200_len).mean()
+    atr = compute_atr(df, atr_len)
 
     df = df.copy()
-    df["sma50"] = sma50
-    df["sma150"] = sma150
+    df["ema10"] = ema10
+    df["ema20"] = ema20
+    df["ema50"] = ema50
     df["sma200"] = sma200
     df["atr"] = atr
     df["dollar_vol"] = df["close"] * df.get("volume", 0)
@@ -100,24 +115,31 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     last = df.iloc[-1]
     idx_last = df.index[-1]
 
+    # 52-week high check
     high_52w = df["high"].rolling(252).max().iloc[-1]
-    near_52w_ok = last["close"] >= (1 - cfg["filters"]["near_52w_high_pct"] / 100.0) * high_52w
+    near_pct = float(cfg.get("filters", {}).get("near_52w_high_pct", 25))
+    near_52w_ok = last["close"] >= (1 - near_pct / 100.0) * high_52w
 
+    # Liquidity check (50-day average close*volume)
+    min_dv = float(cfg.get("filters", {}).get("min_dollar_vol_50d", 10000000))
     dv50 = df["dollar_vol"].rolling(50).mean().iloc[-1]
-    liquidity_ok = dv50 >= cfg["filters"]["min_dollar_vol_50d"]
+    liquidity_ok = dv50 >= min_dv
 
+    # 200MA rising check (today > 20 trading days ago)
     if idx_last - 20 >= 0:
         sma200_up = df["sma200"].iloc[-1] > df["sma200"].iloc[-21]
     else:
         sma200_up = False
 
-    ma_stack_ok = (last["close"] > last["sma50"] > last["sma150"] > last["sma200"])
-    trend_ok = (ma_stack_ok and sma200_up and near_52w_ok and liquidity_ok)
+    # NEW MA rule: 10EMA > 20EMA > 50EMA
+    ema_stack_ok = (last["ema10"] > last["ema20"] > last["ema50"])
+
+    trend_ok = (ema_stack_ok and sma200_up and near_52w_ok and liquidity_ok)
 
     if not trend_ok:
         fails = []
-        if not ma_stack_ok:
-            fails.append("MA stack")
+        if not ema_stack_ok:
+            fails.append("EMA stack")
         if not sma200_up:
             fails.append("200MA not rising")
         if not near_52w_ok:
@@ -127,7 +149,14 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = "Trend fail: " + ", ".join(fails)
         return out
 
-    base_n = cfg["setup_base_breakout"]["base_lookback"]
+    # Base Breakout setup
+    base_cfg = cfg.get("setup_base_breakout", {})
+    base_n = int(base_cfg.get("base_lookback", 30))
+    base_max_depth_pct = float(base_cfg.get("base_max_depth_pct", 15))
+    breakout_buffer_pct = float(base_cfg.get("breakout_buffer_pct", 0.2))
+    vol_mult = float(base_cfg.get("vol_multiplier", 1.2))
+    atr_stop_mult = float(base_cfg.get("atr_stop_mult", 2.0))
+
     if len(df) < base_n + 2:
         out["signal"] = "WATCH"
         out["reason"] = "Trend ok, base window too small"
@@ -138,15 +167,13 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     base_high = base["high"].max()
     base_low = base["low"].min()
     depth_pct = 100.0 * (base_high - base_low) / base_high if base_high and base_high > 0 else 999.0
-    tight_ok = depth_pct <= cfg["setup_base_breakout"]["base_max_depth_pct"]
+    tight_ok = depth_pct <= base_max_depth_pct
 
     pivot = base_high
-    buffer = cfg["setup_base_breakout"]["breakout_buffer_pct"] / 100.0
-    entry = pivot * (1 + buffer)
+    entry = pivot * (1 + breakout_buffer_pct / 100.0)
 
     breakout_ok = last["close"] > entry
 
-    vol_mult = cfg["setup_base_breakout"]["vol_multiplier"]
     vol_ok = True
     if "volume" in df.columns and df["volume"].notna().any():
         base_vol_avg = base["volume"].mean()
@@ -169,16 +196,15 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         out["entry"] = f"{entry:.2f}"
         return out
 
-    atr_mult = cfg["setup_base_breakout"]["atr_stop_mult"]
     atr_val = last.get("atr", np.nan)
-    stop_atr = entry - (atr_mult * atr_val) if not np.isnan(atr_val) else base_low
+    stop_atr = entry - (atr_stop_mult * atr_val) if not np.isnan(atr_val) else base_low
     stop_swing = base_low
     stop = max(stop_swing, stop_atr)
     if stop >= entry:
         stop = stop_swing
 
     score = 40 + 30 + (10 if vol_ok else 0)
-    tight_bonus = int(max(0, min(20, (cfg["setup_base_breakout"]["base_max_depth_pct"] - depth_pct) * 1.5)))
+    tight_bonus = int(max(0, min(20, (base_max_depth_pct - depth_pct) * 1.5)))
     score = int(min(100, score + tight_bonus))
 
     out["signal"] = "BUY_NOW"
@@ -186,7 +212,7 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     out["score"] = score
     out["entry"] = f"{entry:.2f}"
     out["stop"] = f"{stop:.2f}"
-    out["reason"] = "Trend up, near 52w high, tight base, broke pivot" + (", volume ok" if vol_ok else ", volume weak")
+    out["reason"] = "Trend up (EMA stack), 200MA rising, near 52w high, tight base, broke pivot" + (", volume ok" if vol_ok else ", volume weak")
     return out
 
 
@@ -217,10 +243,10 @@ def main():
     if not tickers:
         raise SystemExit("tickers.txt is empty")
 
-    interval = cfg["api"]["interval"]
-    outputsize = int(cfg["api"]["outputsize"])
-    batch_size = int(cfg["api"]["batch_size"])
-    max_rpm = max(1, int(cfg["api"]["max_requests_per_min"]))
+    interval = cfg.get("api", {}).get("interval", "1day")
+    outputsize = int(cfg.get("api", {}).get("outputsize", 260))
+    batch_size = int(cfg.get("api", {}).get("batch_size", 8))
+    max_rpm = max(1, int(cfg.get("api", {}).get("max_requests_per_min", 8)))
     sleep_s = 60.0 / max_rpm
 
     results = []
@@ -242,7 +268,11 @@ def main():
                     payload = data.get(sym, {})
                     df = normalise_timeseries_payload(sym, payload)
                     res = analyse_symbol(df, cfg) if not df.empty else {
-                        "signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "",
+                        "signal": "PASS",
+                        "setup": "",
+                        "score": 0,
+                        "entry": "",
+                        "stop": "",
                         "reason": payload.get("message", "No data"),
                     }
                     results.append((sym, res))
@@ -267,7 +297,7 @@ def main():
     buy_count = 0
 
     for sym, res in results:
-        if res["signal"] == "BUY_NOW":
+        if res.get("signal") == "BUY_NOW":
             buy_count += 1
         rows.append([
             sym,
@@ -292,8 +322,8 @@ def main():
 
     buy_lines = []
     for sym, res in results:
-        if res["signal"] == "BUY_NOW":
-            buy_lines.append(f"{sym} – BUY NOW – Setup: Base Breakout – Entry: {res['entry']} – Stop: {res['stop']} – Reason: {res['reason']}")
+        if res.get("signal") == "BUY_NOW":
+            buy_lines.append(f"{sym} – BUY NOW – Setup: Base Breakout – Entry: {res.get('entry','')} – Stop: {res.get('stop','')} – Reason: {res.get('reason','')}")
 
     print("BUY_NOW signals:")
     for line in buy_lines:
