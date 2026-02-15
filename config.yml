@@ -1,99 +1,61 @@
 api:
   interval: 1day
   outputsize: 260
-
-  # Each symbol costs ~1 credit, even in a batch.
   batch_size: 8
-
-  # Free Basic is typically ~8 API credits per minute.
   max_api_credits_per_min: 8
-
-  # Safety cap: never scan more than this many tickers per run
   max_tickers_per_run: 300
-
-filters:
-  near_52w_high_pct: 25
 
 indicators:
   ema_fast: 10
   ema_mid: 20
   ema_slow: 50
+  sma_fast: 50
+  sma_mid: 150
   sma_slow: 200
   atr_len: 14
 
-# Keep for reference, but default disabled so you have exactly 3 setups in output.
-setup_base_breakout:
-  enabled: false
-  base_lookback: 30
-  base_max_depth_pct: 15
-  breakout_buffer_pct: 0.2
-  vol_multiplier: 1.2
-  atr_stop_mult: 2.0
+filters:
+  near_52w_high_pct: 25
 
-# Qullamaggie (daily-only) with your loosened settings
 setup_qullamaggie_breakout:
   enabled: true
+  impulse_lookback: 60
+  impulse_min_pct: 30
+  cons_min_bars: 10
+  cons_max_bars: 40
+  cons_max_depth_pct: 15
+  cons_max_up_drift_pct: 10
+  cons_max_down_drift_pct: 15
+  higher_low_tol_pct: 2
+  pivot_exclude_last_n: 2
+  breakout_buffer_pct: 0.2
+  surf_close_min_pct: 70
+  surf_max_dist_pct: 6
+  ma_slope_lookback: 5
+  max_ext_pct_above_surf_ma: 8
+  max_ext_atr_mult_above_surf_ma: 3
+  max_breakout_extension_pct: 4
+  stop_width_atr_mult: 1.0
 
-  # Leader selection (within the scanned list)
-  leader_top_pct: 5
-  momentum_windows: [21, 63, 126]
-
-  # Volatility filter (ATR% = ATR14/close*100)
-  min_atr_pct: 2.5
-
-  # Impulse (big move) window BEFORE consolidation
-  impulse_lookback: 63
-  impulse_min_pct: 25.0
-  pullback_from_impulse_high_pct: 35.0
-
-  # Consolidation search window (about 2–9 weeks)
-  cons_min_bars: 8
-  cons_max_bars: 45
-  cons_depth_max_pct: 25.0
-
-  # MA surf and slope rules (loosened)
-  surf_close_above_sma20_pct: 0.6
-  ma_rise_lookback: 3
-
-  # Breakout trigger (slightly earlier)
-  breakout_buffer_pct: 0.05
-
-  # Scoring-only (not required)
-  vol_multiplier: 1.1
-  tr_multiplier: 1.1
-
-  # Stop constraint: (entry - LOD) must be <= ATR14 * this
-  stop_max_atr_mult: 1.2
-
-# Minervini shared filter (applies to both Minervini setups)
-minervini:
-  enabled: true
-
-  # Trend Template (deterministic)
-  min_above_52w_low_mult: 1.3
-
-  # Optional RS proxy within scanned list
-  rs_enabled: true
-  rs_top_pct: 20
-  rs_windows: [63, 126]
-
-# Minervini Setup 1: VCP Breakout
 setup_minervini_vcp:
   enabled: true
-  vcp_lookback: 50
-  vcp_final_range_max_pct: 10.0
-  vcp_vol_dryup_mult: 0.8
-  breakout_buffer_pct: 0.10
-  vcp_breakout_vol_mult: 1.5
-  atr_stop_mult: 2.0
+  lookback_bars: 65
+  pivot_exclude_last_n: 5
+  vcp_max_depth_pct: 35
+  vcp_ratio_12: 0.90
+  vcp_ratio_23: 0.90
+  vol_dryup_mult: 0.85
+  breakout_buffer_pct: 0.2
+  near_breakout_pct: 3
+  max_breakout_extension_pct: 4
+  max_ext_above_sma50_pct: 12
 
-# Minervini Setup 2: 3-Week Tight Breakout
 setup_minervini_3wt:
   enabled: true
-  twt_bars: 15
-  twt_max_range_pct: 8.0
-  twt_week_close_pos: 0.6
-  breakout_buffer_pct: 0.10
-  vol_confirm_enabled: true
-  twt_breakout_vol_mult: 1.2
-  atr_stop_mult: 2.0
+  bars: 15
+  max_range_pct: 8
+  max_drift_pct: 8
+  breakout_buffer_pct: 0.2
+  near_breakout_pct: 3
+  max_breakout_extension_pct: 4
+  max_ext_above_sma50_pct: 12
