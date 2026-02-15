@@ -23,9 +23,7 @@ def parse_symbols_from_text(text: str) -> list[str]:
     tickers: list[str] = []
     seen = set()
 
-    known_exchanges = {
-        "NYSE", "NASDAQ", "AMEX", "NYSEARCA", "ARCA", "BATS", "IEX", "OTC"
-    }
+    known_exchanges = {"NYSE", "NASDAQ", "AMEX", "NYSEARCA", "ARCA", "BATS", "IEX", "OTC"}
 
     if not text:
         return []
@@ -47,6 +45,7 @@ def parse_symbols_from_text(text: str) -> list[str]:
                 left_u = left.strip().upper()
                 right_u = right.strip().upper()
 
+                # TradingView style EXCHANGE:TICKER -> swap it
                 if left_u in known_exchanges and right_u:
                     sym = f"{right_u}:{left_u}"
                 else:
@@ -119,6 +118,7 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
         "format": "JSON",
     }
 
+    # Simple retry on rate limiting
     for attempt in range(2):
         r = requests.get(TD_BASE, params=params, timeout=30)
         if r.status_code == 429 and attempt == 0:
@@ -197,20 +197,25 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     last = df.iloc[-1]
     idx_last = df.index[-1]
 
+    # 52-week high check
     high_52w = df["high"].rolling(252).max().iloc[-1]
     near_pct = float(cfg.get("filters", {}).get("near_52w_high_pct", 25))
     near_52w_ok = last["close"] >= (1 - near_pct / 100.0) * high_52w
 
+    # Liquidity check (50-day average close*volume)
     min_dv = float(cfg.get("filters", {}).get("min_dollar_vol_50d", 10000000))
     dv50 = df["dollar_vol"].rolling(50).mean().iloc[-1]
     liquidity_ok = dv50 >= min_dv
 
+    # 200MA rising check (today > 20 trading days ago)
     if idx_last - 20 >= 0:
         sma200_up = df["sma200"].iloc[-1] > df["sma200"].iloc[-21]
     else:
         sma200_up = False
 
+    # EMA rule: 10EMA > 20EMA > 50EMA
     ema_stack_ok = (last["ema10"] > last["ema20"] > last["ema50"])
+
     trend_ok = (ema_stack_ok and sma200_up and near_52w_ok and liquidity_ok)
 
     if not trend_ok:
@@ -226,6 +231,7 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         out["reason"] = "Trend fail: " + ", ".join(fails)
         return out
 
+    # Base Breakout setup
     base_cfg = cfg.get("setup_base_breakout", {})
     base_n = int(base_cfg.get("base_lookback", 30))
     base_max_depth_pct = float(base_cfg.get("base_max_depth_pct", 15))
@@ -256,6 +262,7 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
         if not np.isnan(base_vol_avg) and base_vol_avg > 0 and not np.isnan(last.get("volume", np.nan)):
             vol_ok = last["volume"] >= base_vol_avg * vol_mult
 
+    # Planned stop (used for WATCH and BUY_NOW)
     atr_val = last.get("atr", np.nan)
     stop_atr = entry - (atr_stop_mult * atr_val) if not np.isnan(atr_val) else base_low
     stop_swing = base_low
@@ -416,6 +423,7 @@ def main():
     ws_signals = upsert_worksheet(sh, "Signals", rows=max(1000, len(results) + 10), cols=12)
     ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=500, cols=12)
     ws_watch = upsert_worksheet(sh, "WATCH", rows=1000, cols=12)
+    ws_summary = upsert_worksheet(sh, "Summary", rows=50, cols=4)
     ws_log = upsert_worksheet(sh, "Run_Log", rows=1000, cols=12)
 
     header = ["ticker", "signal", "setup", "score", "entry", "stop", "reason", "as_of_utc"]
@@ -449,34 +457,58 @@ def main():
         if sig == "WATCH":
             watch_items.append((score, [sym, setup, score, entry, stop, reason, now_utc]))
 
+    watch_count = len(watch_items)
+    pass_count = max(0, len(tickers) - buy_count - watch_count)
+
+    # Signals (full list)
     ws_signals.clear()
     ws_signals.update("A1", rows)
 
+    # BUY_NOW shortlist (sorted high score first)
     buy_items.sort(key=lambda x: x[0], reverse=True)
     buy_rows.extend([row for _, row in buy_items])
     ws_buys.clear()
     ws_buys.update("A1", buy_rows)
 
+    # WATCH shortlist (sorted high score first)
     watch_items.sort(key=lambda x: x[0], reverse=True)
     watch_rows.extend([row for _, row in watch_items])
     ws_watch.clear()
     ws_watch.update("A1", watch_rows)
 
-    ensure_run_log_header(ws_log)
-
+    # Summary tab (simple key/value)
     note = f"ok ({tickers_source})"
     if capped:
         note = f"ok ({tickers_source}) capped {len(tickers)} of {total_before_cap}"
 
+    summary_rows = [
+        ["key", "value"],
+        ["last_run_utc", now_utc],
+        ["tickers_scanned", str(len(tickers))],
+        ["buy_now_count", str(buy_count)],
+        ["watch_count", str(watch_count)],
+        ["pass_count", str(pass_count)],
+        ["errors", str(errors)],
+        ["api_calls", str(api_calls)],
+        ["credits_est", str(credits_est)],
+        ["source", tickers_source],
+        ["note", note],
+    ]
+    ws_summary.clear()
+    ws_summary.update("A1", summary_rows)
+
+    # Run log
+    ensure_run_log_header(ws_log)
     ws_log.append_row(
         [now_utc, len(tickers), buy_count, errors, api_calls, credits_est, note],
         value_input_option="USER_ENTERED",
     )
 
+    # Console output (GitHub Actions log)
     print("BUY_NOW signals:")
     for _, r in buy_items:
         print(r[0])
-    print(f"Done. tickers={len(tickers)} buy_now={buy_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source} capped={capped}")
+    print(f"Done. tickers={len(tickers)} buy_now={buy_count} watch={watch_count} pass={pass_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source} capped={capped}")
 
 
 if __name__ == "__main__":
