@@ -2,10 +2,10 @@ api:
   interval: 1day
   outputsize: 260
 
-  # Each symbol costs 1 credit, even in a batch.
+  # Each symbol costs ~1 credit, even in a batch.
   batch_size: 8
 
-  # Free Basic is typically 8 API credits per minute.
+  # Free Basic is typically ~8 API credits per minute.
   max_api_credits_per_min: 8
 
   # Safety cap: never scan more than this many tickers per run
@@ -13,7 +13,6 @@ api:
 
 filters:
   near_52w_high_pct: 25
-  min_dollar_vol_50d: 10000000
 
 indicators:
   ema_fast: 10
