@@ -39,6 +39,7 @@ def parse_symbols_from_text(text: str) -> list[str]:
                 continue
 
             p = p.strip()
+
             if ":" in p:
                 left, right = p.split(":", 1)
                 left_u = left.strip().upper()
@@ -60,11 +61,8 @@ def parse_symbols_from_text(text: str) -> list[str]:
 
 
 def read_tickers_from_file(path: str) -> list[str]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return parse_symbols_from_text(f.read())
-    except FileNotFoundError:
-        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return parse_symbols_from_text(f.read())
 
 
 def read_tickers_from_sheet(sh) -> list[str]:
@@ -107,6 +105,24 @@ def display_ticker(sym: str) -> str:
     return sym.strip().upper()
 
 
+def dedupe_by_display_ticker(symbols: list[str]) -> list[str]:
+    """
+    Prevent duplicates like:
+      - ANDE
+      - ANDE:NASDAQ
+    Both display as ANDE, so we keep the first.
+    """
+    out = []
+    seen = set()
+    for s in symbols:
+        d = display_ticker(s)
+        if d in seen:
+            continue
+        seen.add(d)
+        out.append(s)
+    return out
+
+
 def chunks(items: list[str], n: int) -> list[list[str]]:
     return [items[i:i + n] for i in range(0, len(items), n)]
 
@@ -127,7 +143,6 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
         "format": "JSON",
     }
 
-    # Retry with backoff on rate limiting and transient errors
     backoffs = [3, 10, 30]
     last_err = None
 
@@ -138,7 +153,15 @@ def fetch_time_series_batch(api_key: str, symbols: list[str], interval: str, out
                 time.sleep(backoffs[min(i, len(backoffs) - 1)])
                 continue
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+
+            # Sometimes TD returns a top-level error payload
+            if isinstance(data, dict) and data.get("status") == "error":
+                msg = data.get("message", "Twelve Data error")
+                code = data.get("code", "")
+                raise RuntimeError(f"TwelveData error {code}: {msg}")
+
+            return data
         except Exception as e:
             last_err = e
             if i < len(backoffs):
@@ -209,6 +232,7 @@ def prepare_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     out["atr"] = compute_atr(out, atr_len)
     out["high_52w"] = out["high"].rolling(252).max()
     out["low_52w"] = out["low"].rolling(252).min()
+    out["vol20"] = out["volume"].rolling(20).mean()
     return out
 
 
@@ -259,23 +283,11 @@ def trend_template_minervini(df: pd.DataFrame, cfg: dict) -> tuple[bool, str]:
     return True, "Trend template ok"
 
 
+# -----------------------------
+# Setup A (strict base breakout)
+# -----------------------------
 def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
-    """
-    Fixed Qullamaggie MA-surf breakout:
-
-    Requires:
-      1) A real impulse leg BEFORE the base (pre-window)
-      2) A meaningful base (min depth), not a one-candle dip
-      3) Sideways/mild pullback base (tight up-drift)
-      4) Tightening in the base (range contraction)
-      5) Higher lows proxy (last-third low > first-third low)
-      6) MA support (touch count near MA)
-      7) Pivot tested (multiple touches near pivot)
-      8) Breakout today above buffered pivot
-
-    This stops “stair-step uptrend” being labelled as a Qullamaggie base.
-    """
-    out = {"signal": "PASS", "setup": "Qullamaggie Breakout", "score": 0, "entry": "", "stop": "", "reason": ""}
+    out = {"signal": "PASS", "setup": "Qullamaggie Base Breakout", "score": 0, "entry": "", "stop": "", "reason": ""}
 
     scfg = cfg.get("setup_qullamaggie_breakout", {}) or {}
     if not bool(scfg.get("enabled", True)):
@@ -291,39 +303,50 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
     today_low = float(last["low"])
     atr = float(last.get("atr", np.nan))
 
-    impulse_lookback = max(20, int(scfg.get("impulse_lookback", 60)))
+    impulse_lookback = max(10, int(scfg.get("impulse_lookback", 60)))
     impulse_min_pct = float(scfg.get("impulse_min_pct", 30.0))
 
-    cons_min = int(scfg.get("cons_min_bars", 12))
-    cons_max = int(scfg.get("cons_max_bars", 40))
-
-    cons_min_depth_pct = float(scfg.get("cons_min_depth_pct", 3.0))
+    cons_min = int(scfg.get("cons_min_bars", 15))
+    cons_max = int(scfg.get("cons_max_bars", 45))
     cons_max_depth_pct = float(scfg.get("cons_max_depth_pct", 15.0))
+    cons_min_depth_pct = float(scfg.get("cons_min_depth_pct", 4.0))
 
+    # Make "base" more sideways by default (you can loosen)
     cons_max_up_drift_pct = float(scfg.get("cons_max_up_drift_pct", 3.0))
-    cons_max_down_drift_pct = float(scfg.get("cons_max_down_drift_pct", 12.0))
-
-    cons_range_contract_ratio = float(scfg.get("cons_range_contract_ratio", 0.90))
-    cons_range_contract_min_first_pct = float(scfg.get("cons_range_contract_min_first_pct", 4.0))
-
-    higher_low_min_raise_pct = float(scfg.get("higher_low_min_raise_pct", 0.25))
+    cons_max_down_drift_pct = float(scfg.get("cons_max_down_drift_pct", 10.0))
 
     breakout_buffer_pct = float(scfg.get("breakout_buffer_pct", 0.2))
     pivot_exclude_last_n = int(scfg.get("pivot_exclude_last_n", 2))
-    pivot_touch_tol_pct = float(scfg.get("pivot_touch_tol_pct", 0.30))
-    pivot_touch_min_count = int(scfg.get("pivot_touch_min_count", 2))
 
     surf_close_min_pct = float(scfg.get("surf_close_min_pct", 70.0))
-    surf_max_dist_pct = float(scfg.get("surf_max_dist_pct", 3.0))
+    surf_max_dist_pct = float(scfg.get("surf_max_dist_pct", 6.0))
     ma_slope_lookback = int(scfg.get("ma_slope_lookback", 5))
+    higher_low_tol_pct = float(scfg.get("higher_low_tol_pct", 2.0))
 
-    ma_touch_max_pct = float(scfg.get("ma_touch_max_pct", 1.0))
-    ma_touch_min_count = int(scfg.get("ma_touch_min_count", 2))
+    surf_touch_tol_pct = float(scfg.get("surf_touch_tol_pct", 1.0))
+    surf_touch_min_count = int(scfg.get("surf_touch_min_count", 3))
 
-    max_ext_pct = float(scfg.get("max_ext_pct_above_surf_ma", 6.0))
-    max_ext_atr_mult = float(scfg.get("max_ext_atr_mult_above_surf_ma", 2.5))
-    max_breakout_extension_pct = float(scfg.get("max_breakout_extension_pct", 3.0))
+    tighten_last_half_ratio = float(scfg.get("tighten_last_half_ratio", 0.85))
+
+    pivot_test_tol_pct = float(scfg.get("pivot_test_tol_pct", 0.7))
+    pivot_tests_min_count = int(scfg.get("pivot_tests_min_count", 2))
+
+    breakout_vol_mult = float(scfg.get("breakout_vol_mult", 1.20))
+
+    max_ext_pct = float(scfg.get("max_ext_pct_above_surf_ma", 8.0))
+    max_ext_atr_mult = float(scfg.get("max_ext_atr_mult_above_surf_ma", 3.0))
+    max_breakout_extension_pct = float(scfg.get("max_breakout_extension_pct", 4.0))
     stop_width_atr_mult = float(scfg.get("stop_width_atr_mult", 1.0))
+
+    impulse_low = df["low"].rolling(impulse_lookback).min().iloc[-1]
+    if np.isnan(impulse_low) or impulse_low <= 0:
+        out["reason"] = "Impulse calc failed"
+        return out
+
+    impulse_pct = 100.0 * (today_close / float(impulse_low) - 1.0)
+    if impulse_pct < impulse_min_pct:
+        out["reason"] = f"Impulse too small ({impulse_pct:.0f}%)"
+        return out
 
     ema10 = float(last.get("ema10", np.nan))
     ema20 = float(last.get("ema20", np.nan))
@@ -338,81 +361,42 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
     best = None  # (score, details)
 
     for n in range(cons_min, cons_max + 1):
-        if len(df) < (impulse_lookback + n + 2):
+        if len(df) < n + 2:
             continue
 
         cons = df.iloc[-(n + 1):-1].copy()  # ends yesterday
         if cons.empty:
             continue
 
-        # Impulse must be before the base
-        pre = df.iloc[-(n + 1 + impulse_lookback):-(n + 1)].copy()
-        if pre.empty:
-            continue
-
-        pre_low = float(pre["low"].min())
-        pre_high = float(pre["high"].max())
-        if np.isnan(pre_low) or pre_low <= 0 or np.isnan(pre_high) or pre_high <= 0:
-            continue
-
-        impulse_pct = 100.0 * (pre_high / pre_low - 1.0)
-        if impulse_pct < impulse_min_pct:
-            continue
-
-        # Base depth must be meaningful and not too deep
         cons_high = float(cons["high"].max())
         cons_low = float(cons["low"].min())
         depth_pct = pct_range(cons_high, cons_low)
-        if depth_pct < cons_min_depth_pct or depth_pct > cons_max_depth_pct:
+        if depth_pct > cons_max_depth_pct or depth_pct < cons_min_depth_pct:
             continue
 
-        # Sideways / mild pullback, not marching up
         c0 = float(cons["close"].iloc[0])
         c1 = float(cons["close"].iloc[-1])
         drift_pct = 100.0 * (c1 / c0 - 1.0) if c0 > 0 else 999.0
         if drift_pct > cons_max_up_drift_pct or drift_pct < -cons_max_down_drift_pct:
             continue
 
-        # Tightening: last third range contracts vs first third (when first is meaningful)
         third = max(2, int(len(cons) / 3))
-        hi_first = float(cons["high"].iloc[:third].max())
-        lo_first = float(cons["low"].iloc[:third].min())
-        hi_last = float(cons["high"].iloc[-third:].max())
-        lo_last = float(cons["low"].iloc[-third:].min())
-
-        r_first = pct_range(hi_first, lo_first)
-        r_last = pct_range(hi_last, lo_last)
-        if r_first >= cons_range_contract_min_first_pct and r_last > r_first * cons_range_contract_ratio:
+        low_first = float(cons["low"].iloc[:third].min())
+        low_last = float(cons["low"].iloc[-third:].min())
+        if low_last < low_first * (1 - higher_low_tol_pct / 100.0):
             continue
 
-        # Higher lows proxy
-        if lo_last < lo_first * (1 + higher_low_min_raise_pct / 100.0):
+        half = max(2, int(len(cons) / 2))
+        first_half = cons.iloc[:half]
+        last_half = cons.iloc[half:]
+        r1 = pct_range(float(first_half["high"].max()), float(first_half["low"].min())) if not first_half.empty else 999.0
+        r2 = pct_range(float(last_half["high"].max()), float(last_half["low"].min())) if not last_half.empty else 999.0
+        if r2 > r1 * tighten_last_half_ratio:
             continue
 
-        # Pivot must be real and tested
-        excl = max(0, int(pivot_exclude_last_n))
-        if excl >= len(cons):
-            excl = max(0, len(cons) - 1)
-
-        pivot_slice = cons["high"].iloc[:len(cons) - excl] if excl > 0 else cons["high"]
-        if pivot_slice.empty:
-            continue
-
-        pivot = float(pivot_slice.max())
-        if pivot <= 0:
-            continue
-
-        pivot_touches = int((pivot_slice >= pivot * (1 - pivot_touch_tol_pct / 100.0)).sum())
-        if pivot_touches < pivot_touch_min_count:
-            continue
-
-        entry = pivot * (1 + breakout_buffer_pct / 100.0)
-        breakout = today_close > entry
-
-        # MA support base: must actually "find support" on the MA (touches)
         surf_candidates = [("EMA10", cons["ema10"]), ("EMA20", cons["ema20"]), ("EMA50", cons["ema50"])]
 
-        best_surf = None  # (surf_score, name, ma_last)
+        best_surf = None  # (surf_score, name, ma_last, dist_med_pct, close_above_pct, touch_count)
         for name, ma_series in surf_candidates:
             if ma_series.isna().all():
                 continue
@@ -431,30 +415,57 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
             if dist_med_pct > surf_max_dist_pct:
                 continue
 
-            touch_count = int((cons["low"] <= ma_series * (1 + ma_touch_max_pct / 100.0)).sum())
-            if touch_count < ma_touch_min_count:
+            touch = (cons["low"] <= ma_series * (1 + surf_touch_tol_pct / 100.0))
+            touch_count = int(touch.sum())
+            if touch_count < surf_touch_min_count:
                 continue
 
-            surf_score = close_above_pct - 0.7 * dist_med_pct + 2.0 * min(5, touch_count)
-            candidate = (surf_score, name, float(ma_series.iloc[-1]))
+            surf_score = close_above_pct - 0.5 * dist_med_pct + min(12.0, touch_count * 2.0)
+            candidate = (surf_score, name, float(ma_series.iloc[-1]), dist_med_pct, close_above_pct, touch_count)
             best_surf = candidate if best_surf is None or candidate[0] > best_surf[0] else best_surf
 
         if best_surf is None:
             continue
 
-        surf_ma_last = float(best_surf[2])
-        ext_pct = 100.0 * (today_close / surf_ma_last - 1.0) if surf_ma_last > 0 else 999.0
-        ext_atr = (today_close - surf_ma_last) / atr if (not np.isnan(atr) and atr > 0) else 0.0
+        excl = max(0, int(pivot_exclude_last_n))
+        if excl >= len(cons):
+            excl = max(0, len(cons) - 1)
+
+        pivot_slice = cons["high"].iloc[:len(cons) - excl] if excl > 0 else cons["high"]
+        if pivot_slice.empty:
+            continue
+
+        pivot = float(pivot_slice.max())
+
+        near_pivot = cons["high"] >= pivot * (1 - pivot_test_tol_pct / 100.0)
+        if int(near_pivot.sum()) < pivot_tests_min_count:
+            continue
+
+        entry = pivot * (1 + breakout_buffer_pct / 100.0)
+        breakout = today_close > entry
+
+        ext_pct = 100.0 * (today_close / best_surf[2] - 1.0) if best_surf[2] > 0 else 999.0
+        ext_atr = (today_close - best_surf[2]) / atr if (not np.isnan(atr) and atr > 0) else 0.0
         extended = (
             (ext_pct > max_ext_pct)
             or (ext_atr > max_ext_atr_mult)
             or (today_close > entry * (1 + max_breakout_extension_pct / 100.0))
         )
 
-        base_score = 50
+        base_score = 45
         impulse_bonus = int(min(30, max(0, (impulse_pct - impulse_min_pct) / 2.0)))
         tight_bonus = int(max(0, min(20, (cons_max_depth_pct - depth_pct) * 1.5)))
-        score = int(min(100, base_score + impulse_bonus + tight_bonus))
+        surf_bonus = int(max(0, min(20, best_surf[0] / 5.0)))
+        contract_bonus = int(max(0, min(10, (r1 - r2) * 1.0)))
+        pivot_bonus = int(max(0, min(10, (int(near_pivot.sum()) - pivot_tests_min_count) * 2)))
+
+        score = int(min(100, base_score + impulse_bonus + tight_bonus + surf_bonus + contract_bonus + pivot_bonus))
+
+        if breakout:
+            vol = float(last.get("volume", np.nan))
+            vol20 = float(last.get("vol20", np.nan))
+            if not np.isnan(vol) and not np.isnan(vol20) and vol20 > 0 and vol >= vol20 * breakout_vol_mult:
+                score = min(100, score + 5)
 
         details = {
             "n": n,
@@ -465,12 +476,13 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
             "score": score,
             "impulse_pct": impulse_pct,
             "surf_name": best_surf[1],
+            "touches": best_surf[5],
         }
 
         best = (score, details) if best is None or score > best[0] else best
 
     if best is None:
-        out["reason"] = "No valid Qullamaggie MA-support base found (support touches + pivot tests)"
+        out["reason"] = "No valid sideways base (needs depth+touches+tightening+pivot tests)"
         return out
 
     d = best[1]
@@ -483,10 +495,10 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
 
     if not d["breakout"]:
         out["signal"] = "WATCH"
-        out["reason"] = f"Impulse {d['impulse_pct']:.0f}%, {d['n']}d MA-support base ({d['surf_name']}), no breakout yet"
+        out["reason"] = f"Impulse {d['impulse_pct']:.0f}%, {d['n']}d base surfing {d['surf_name']} ({d['touches']} touches), tightening, no breakout yet"
         return out
 
-    stop_lod = today_low if not np.isnan(today_low) else cons_low
+    stop_lod = float(last.get("low", np.nan))
     stop_dist = entry - stop_lod
     if stop_dist <= 0:
         stop_lod = cons_low
@@ -506,7 +518,258 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict) -> dict:
 
     out["signal"] = "BUY_NOW"
     out["stop"] = f"{stop_lod:.2f}"
-    out["reason"] = f"Impulse {d['impulse_pct']:.0f}%, {d['n']}d MA-support base ({d['surf_name']}), pivot tested, breakout"
+    out["reason"] = f"Impulse {d['impulse_pct']:.0f}%, {d['n']}d base surfing {d['surf_name']} ({d['touches']} touches), broke pivot"
+    return out
+
+
+# -----------------------------------------
+# Setup D (your staircase pullback entry)
+# -----------------------------------------
+def eval_qullamaggie_staircase(df: pd.DataFrame, cfg: dict) -> dict:
+    out = {"signal": "PASS", "setup": "Qullamaggie Staircase Pullback", "score": 0, "entry": "", "stop": "", "reason": ""}
+
+    scfg = cfg.get("setup_qullamaggie_staircase", {}) or {}
+    if not bool(scfg.get("enabled", True)):
+        out["reason"] = "Disabled"
+        return out
+
+    if df.empty or len(df) < 120:
+        out["reason"] = "Not enough daily data"
+        return out
+
+    last = df.iloc[-1]
+    today_close = float(last["close"])
+    today_low = float(last["low"])
+    atr = float(last.get("atr", np.nan))
+
+    ema10 = float(last.get("ema10", np.nan))
+    ema20 = float(last.get("ema20", np.nan))
+    ema50 = float(last.get("ema50", np.nan))
+    if any(np.isnan(x) for x in [ema10, ema20, ema50]):
+        out["reason"] = "Not enough data for EMAs"
+        return out
+
+    # Trend
+    if not (ema10 > ema20 > ema50):
+        out["reason"] = "EMA stack fail (10>20>50)"
+        return out
+
+    ma_slope_lookback = int(scfg.get("ma_slope_lookback", 5))
+    if len(df) > ma_slope_lookback + 1:
+        if not (df["ema20"].iloc[-1] > df["ema20"].iloc[-(ma_slope_lookback + 1)]):
+            out["reason"] = "EMA20 not rising"
+            return out
+
+    # Impulse filter (bigger move = better)
+    impulse_lookback = max(10, int(scfg.get("impulse_lookback", 60)))
+    impulse_min_pct = float(scfg.get("impulse_min_pct", 25.0))
+
+    impulse_low = df["low"].rolling(impulse_lookback).min().iloc[-1]
+    if np.isnan(impulse_low) or impulse_low <= 0:
+        out["reason"] = "Impulse calc failed"
+        return out
+
+    impulse_pct = 100.0 * (today_close / float(impulse_low) - 1.0)
+    if impulse_pct < impulse_min_pct:
+        out["reason"] = f"Impulse too small ({impulse_pct:.0f}%)"
+        return out
+
+    # Pullback window (ends yesterday)
+    pb_min = int(scfg.get("pb_min_bars", 3))
+    pb_max = int(scfg.get("pb_max_bars", 12))
+
+    pb_max_range_pct = float(scfg.get("pb_max_range_pct", 8.0))
+    pb_max_up_drift_pct = float(scfg.get("pb_max_up_drift_pct", 6.0))
+    pb_max_down_drift_pct = float(scfg.get("pb_max_down_drift_pct", 10.0))
+
+    pre_high_lookback = int(scfg.get("pre_high_lookback", 20))
+    min_pullback_from_pre_high_pct = float(scfg.get("min_pullback_from_pre_high_pct", 2.0))
+    max_pullback_from_pre_high_pct = float(scfg.get("max_pullback_from_pre_high_pct", 12.0))
+
+    higher_low_tol_pct = float(scfg.get("higher_low_tol_pct", 2.0))
+
+    # MA interaction (this is the “find support on 10/20” piece)
+    surf_touch_tol_pct = float(scfg.get("surf_touch_tol_pct", 1.0))
+    surf_touch_min_count = int(scfg.get("surf_touch_min_count", 1))
+    surf_close_min_pct = float(scfg.get("surf_close_min_pct", 60.0))
+
+    tighten_last_half_ratio = float(scfg.get("tighten_last_half_ratio", 0.90))
+
+    pivot_exclude_last_n = int(scfg.get("pivot_exclude_last_n", 1))
+    breakout_buffer_pct = float(scfg.get("breakout_buffer_pct", 0.2))
+
+    max_breakout_extension_pct = float(scfg.get("max_breakout_extension_pct", 4.0))
+    max_ext_pct_above_surf_ma = float(scfg.get("max_ext_pct_above_surf_ma", 10.0))
+    stop_width_atr_mult = float(scfg.get("stop_width_atr_mult", 1.0))
+
+    breakout_vol_mult = float(scfg.get("breakout_vol_mult", 1.15))
+
+    best = None  # (score, details)
+
+    for n in range(pb_min, pb_max + 1):
+        if len(df) < n + 2:
+            continue
+
+        pb = df.iloc[-(n + 1):-1].copy()  # ends yesterday
+        if pb.empty:
+            continue
+
+        pb_high = float(pb["high"].max())
+        pb_low = float(pb["low"].min())
+        pb_range_pct = pct_range(pb_high, pb_low)
+        if pb_range_pct > pb_max_range_pct:
+            continue
+
+        c0 = float(pb["close"].iloc[0])
+        c1 = float(pb["close"].iloc[-1])
+        drift_pct = 100.0 * (c1 / c0 - 1.0) if c0 > 0 else 999.0
+        if drift_pct > pb_max_up_drift_pct or drift_pct < -pb_max_down_drift_pct:
+            continue
+
+        # Higher-lows inside pullback
+        third = max(2, int(len(pb) / 3))
+        low_first = float(pb["low"].iloc[:third].min())
+        low_last = float(pb["low"].iloc[-third:].min())
+        if low_last < low_first * (1 - higher_low_tol_pct / 100.0):
+            continue
+
+        # Tightening within the pullback (helps avoid “straight up”)
+        half = max(2, int(len(pb) / 2))
+        first_half = pb.iloc[:half]
+        last_half = pb.iloc[half:]
+        r1 = pct_range(float(first_half["high"].max()), float(first_half["low"].min())) if not first_half.empty else 999.0
+        r2 = pct_range(float(last_half["high"].max()), float(last_half["low"].min())) if not last_half.empty else 999.0
+        if r2 > r1 * tighten_last_half_ratio:
+            continue
+
+        # Pre-pullback high (to force a real pullback)
+        end_pre = len(df) - (n + 1)
+        start_pre = max(0, end_pre - pre_high_lookback)
+        pre = df.iloc[start_pre:end_pre]
+        if pre.empty:
+            continue
+        pre_high = float(pre["high"].max())
+        if pre_high <= 0:
+            continue
+
+        pullback_from_high_pct = 100.0 * (1.0 - pb_low / pre_high)
+        if pullback_from_high_pct < min_pullback_from_pre_high_pct:
+            continue
+        if pullback_from_high_pct > max_pullback_from_pre_high_pct:
+            continue
+
+        # Choose surf MA = EMA10 or EMA20 (whichever is “held” better)
+        candidates = [("EMA10", pb["ema10"]), ("EMA20", pb["ema20"])]
+        best_surf = None  # (name, ma_last, close_above_pct, touch_count, dist_med_pct, surf_score)
+
+        for name, ma in candidates:
+            if ma.isna().all():
+                continue
+
+            close_above_pct = float((pb["close"] >= ma).mean() * 100.0)
+            if close_above_pct < surf_close_min_pct:
+                continue
+
+            touch = pb["low"] <= ma * (1 + surf_touch_tol_pct / 100.0)
+            touch_count = int(touch.sum())
+            if touch_count < surf_touch_min_count:
+                continue
+
+            dist_med_pct = float(((pb["close"] - ma).abs() / pb["close"]).median() * 100.0)
+            surf_score = close_above_pct - 0.6 * dist_med_pct + min(6.0, touch_count * 2.0)
+
+            cand = (name, float(ma.iloc[-1]), close_above_pct, touch_count, dist_med_pct, surf_score)
+            best_surf = cand if best_surf is None or cand[5] > best_surf[5] else best_surf
+
+        if best_surf is None:
+            continue
+
+        # Pivot + entry
+        excl = max(0, int(pivot_exclude_last_n))
+        if excl >= len(pb):
+            excl = max(0, len(pb) - 1)
+
+        pivot_slice = pb["high"].iloc[:len(pb) - excl] if excl > 0 else pb["high"]
+        if pivot_slice.empty:
+            continue
+
+        pivot = float(pivot_slice.max())
+        entry = pivot * (1 + breakout_buffer_pct / 100.0)
+        breakout = today_close > entry
+
+        # Extended protection
+        surf_ma_last = best_surf[1]
+        ext_pct_vs_ma = 100.0 * (today_close / surf_ma_last - 1.0) if surf_ma_last > 0 else 999.0
+        extended = (today_close > entry * (1 + max_breakout_extension_pct / 100.0)) or (ext_pct_vs_ma > max_ext_pct_above_surf_ma)
+
+        # Score
+        base_score = 50
+        impulse_bonus = int(min(35, max(0, (impulse_pct - impulse_min_pct) / 1.8)))
+        pb_tight_bonus = int(max(0, min(20, (pb_max_range_pct - pb_range_pct) * 2.0)))
+        contract_bonus = int(max(0, min(10, (r1 - r2) * 1.2)))
+        touch_bonus = int(min(10, best_surf[3] * 3))
+        score = int(min(100, base_score + impulse_bonus + pb_tight_bonus + contract_bonus + touch_bonus))
+
+        if breakout:
+            vol = float(last.get("volume", np.nan))
+            vol20 = float(last.get("vol20", np.nan))
+            if not np.isnan(vol) and not np.isnan(vol20) and vol20 > 0 and vol >= vol20 * breakout_vol_mult:
+                score = min(100, score + 5)
+
+        details = {
+            "n": n,
+            "entry": entry,
+            "pb_low": pb_low,
+            "breakout": breakout,
+            "extended": extended,
+            "score": score,
+            "impulse_pct": impulse_pct,
+            "surf_name": best_surf[0],
+            "touches": best_surf[3],
+            "pullback_from_high_pct": pullback_from_high_pct,
+        }
+
+        best = (score, details) if best is None or score > best[0] else best
+
+    if best is None:
+        out["reason"] = "No valid staircase pullback found"
+        return out
+
+    d = best[1]
+    entry = float(d["entry"])
+    pb_low = float(d["pb_low"])
+
+    out["entry"] = f"{entry:.2f}"
+    out["stop"] = f"{pb_low:.2f}"
+    out["score"] = int(d["score"])
+
+    if not d["breakout"]:
+        out["signal"] = "WATCH"
+        out["reason"] = f"Impulse {d['impulse_pct']:.0f}%, {d['n']}d pullback to {d['surf_name']} ({d['touches']} touches), pullback {d['pullback_from_high_pct']:.1f}%, no breakout yet"
+        return out
+
+    # Breakout stop = LOD, with ATR width constraint
+    stop_lod = today_low if not np.isnan(today_low) else pb_low
+    stop_dist = entry - stop_lod
+    if stop_dist <= 0:
+        stop_lod = pb_low
+        stop_dist = entry - stop_lod
+
+    if not np.isnan(atr) and atr > 0 and stop_dist > atr * stop_width_atr_mult:
+        out["signal"] = "PASS"
+        out["stop"] = f"{stop_lod:.2f}"
+        out["reason"] = f"Breakout, but LOD stop too wide vs ATR (dist {stop_dist:.2f} > {stop_width_atr_mult:.1f}x ATR)"
+        return out
+
+    if d["extended"]:
+        out["signal"] = "WATCH"
+        out["stop"] = f"{stop_lod:.2f}"
+        out["reason"] = f"Breakout, but extended vs {d['surf_name']} / entry"
+        return out
+
+    out["signal"] = "BUY_NOW"
+    out["stop"] = f"{stop_lod:.2f}"
+    out["reason"] = f"Impulse {d['impulse_pct']:.0f}%, staircase pullback {d['n']}d to {d['surf_name']} ({d['touches']} touches), broke micro pivot"
     return out
 
 
@@ -740,6 +1003,7 @@ def analyse_symbol_multi(df: pd.DataFrame, cfg: dict) -> list[dict]:
 
     return [
         eval_qullamaggie_breakout(df_i, cfg),
+        eval_qullamaggie_staircase(df_i, cfg),
         eval_minervini_vcp(df_i, cfg),
         eval_minervini_3wt(df_i, cfg),
     ]
@@ -778,14 +1042,6 @@ def ensure_run_log_header(ws_log):
 
 
 def rate_limit_wait(batch_credits: int, max_credits_per_min: int, state: dict) -> None:
-    """
-    Enforces a simple per-minute credits window.
-    We assume 1 credit per symbol in the batch.
-
-    state keys:
-      - window_start (monotonic seconds)
-      - used (credits used in current window)
-    """
     if max_credits_per_min <= 0:
         return
 
@@ -833,7 +1089,10 @@ def main():
         tickers_source = "file"
 
     if not tickers:
-        raise SystemExit("No tickers found (Tickers tab empty and tickers.txt missing/empty)")
+        raise SystemExit("No tickers found (Tickers tab empty and tickers.txt empty)")
+
+    # Prevent duplicate display tickers
+    tickers = dedupe_by_display_ticker(tickers)
 
     interval = cfg.get("api", {}).get("interval", "1day")
     outputsize = int(cfg.get("api", {}).get("outputsize", 260))
@@ -864,41 +1123,15 @@ def main():
             data = fetch_time_series_batch(td_key, sym_batch, interval, outputsize)
             api_calls += 1
 
-            # If the whole response is an error, apply it to the entire batch
-            if isinstance(data, dict) and data.get("status") == "error":
-                msg = data.get("message", "Provider error")
-                for sym in sym_batch:
-                    results.append({
-                        "ticker": sym,
-                        "signal": "PASS",
-                        "setup": "",
-                        "score": 0,
-                        "entry": "",
-                        "stop": "",
-                        "reason": f"Twelve Data error: {msg}",
-                    })
-                errors += 1
-                continue
-
-            # Single-symbol response
             if isinstance(data, dict) and "values" in data:
                 sym = sym_batch[0]
                 df = normalise_timeseries_payload(sym, data)
-                if df.empty:
-                    results.append({
-                        "ticker": sym,
-                        "signal": "PASS",
-                        "setup": "",
-                        "score": 0,
-                        "entry": "",
-                        "stop": "",
-                        "reason": data.get("message", "No data"),
-                    })
-                else:
-                    for r in analyse_symbol_multi(df, cfg):
-                        results.append({"ticker": sym, **r})
+                res_list = analyse_symbol_multi(df, cfg) if not df.empty else [{
+                    "signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": data.get("message", "No data")
+                }]
+                for r in res_list:
+                    results.append({"ticker": sym, **r})
             else:
-                # Batch response: dict keyed by symbol string
                 for sym in sym_batch:
                     payload = data.get(sym, {}) if isinstance(data, dict) else {}
                     df = normalise_timeseries_payload(sym, payload)
@@ -1017,10 +1250,7 @@ def main():
     print("BUY_NOW signals:")
     for _, r in buy_items:
         print(r[0])
-    print(
-        f"Done. tickers={len(tickers)} results={len(results)} buy_now={buy_count} watch={watch_count} "
-        f"pass={pass_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source}"
-    )
+    print(f"Done. tickers={len(tickers)} results={len(results)} buy_now={buy_count} watch={watch_count} pass={pass_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source}")
 
 
 if __name__ == "__main__":
