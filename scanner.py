@@ -98,6 +98,13 @@ def read_tickers_from_sheet(sh) -> list[str]:
     return parse_symbols_from_text("\n".join(lines))
 
 
+def display_ticker(sym: str) -> str:
+    # Convert MSFT:NASDAQ -> MSFT for display
+    if ":" in sym:
+        return sym.split(":", 1)[0].strip().upper()
+    return sym.strip().upper()
+
+
 def chunks(items: list[str], n: int) -> list[list[str]]:
     return [items[i:i + n] for i in range(0, len(items), n)]
 
@@ -447,36 +454,35 @@ def main():
         stop = res.get("stop", "")
         reason = res.get("reason", "")
 
+        # Keep raw symbol in Signals (helps debugging)
         rows.append([sym, sig, setup, score, entry, stop, reason, now_utc])
+
+        sym_disp = display_ticker(sym)
 
         if sig == "BUY_NOW":
             buy_count += 1
-            line = f"{sym} – BUY NOW – Setup: {setup} – Entry: {entry} – Stop: {stop} – Reason: {reason}"
-            buy_items.append((score, [line, sym, setup, score, entry, stop, reason, now_utc]))
+            line = f"{sym_disp} – BUY NOW – Setup: {setup} – Entry: {entry} – Stop: {stop} – Reason: {reason}"
+            buy_items.append((score, [line, sym_disp, setup, score, entry, stop, reason, now_utc]))
 
         if sig == "WATCH":
-            watch_items.append((score, [sym, setup, score, entry, stop, reason, now_utc]))
+            watch_items.append((score, [sym_disp, setup, score, entry, stop, reason, now_utc]))
 
     watch_count = len(watch_items)
     pass_count = max(0, len(tickers) - buy_count - watch_count)
 
-    # Signals (full list)
     ws_signals.clear()
     ws_signals.update("A1", rows)
 
-    # BUY_NOW shortlist (sorted high score first)
     buy_items.sort(key=lambda x: x[0], reverse=True)
     buy_rows.extend([row for _, row in buy_items])
     ws_buys.clear()
     ws_buys.update("A1", buy_rows)
 
-    # WATCH shortlist (sorted high score first)
     watch_items.sort(key=lambda x: x[0], reverse=True)
     watch_rows.extend([row for _, row in watch_items])
     ws_watch.clear()
     ws_watch.update("A1", watch_rows)
 
-    # Summary tab (simple key/value)
     note = f"ok ({tickers_source})"
     if capped:
         note = f"ok ({tickers_source}) capped {len(tickers)} of {total_before_cap}"
@@ -497,14 +503,12 @@ def main():
     ws_summary.clear()
     ws_summary.update("A1", summary_rows)
 
-    # Run log
     ensure_run_log_header(ws_log)
     ws_log.append_row(
         [now_utc, len(tickers), buy_count, errors, api_calls, credits_est, note],
         value_input_option="USER_ENTERED",
     )
 
-    # Console output (GitHub Actions log)
     print("BUY_NOW signals:")
     for _, r in buy_items:
         print(r[0])
