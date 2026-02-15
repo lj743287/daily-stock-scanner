@@ -253,13 +253,46 @@ def pick_best(results: list[dict]) -> dict:
     return best or {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": ""}
 
 
-def build_debug_summary(setup_results: list[dict], chosen_setup: str) -> str:
+def build_debug_summary(setup_results: list[dict], chosen_setup: str, max_items: int = 3) -> str:
     """
-    Creates a concise string describing other setups that were close:
+    Creates a concise string describing other setups:
       - WATCH setups (pattern ok but no breakout yet)
       - PASS setups with late-stage failures (eg volume confirm, stop too wide)
+      - PASS setups with early-stage failures (trend fail, leader fail, pattern fail)
+    Priority: WATCH -> late-stage PASS -> early-stage PASS
     """
-    items = []
+    watch_items: list[str] = []
+    late_items: list[str] = []
+    early_items: list[str] = []
+
+    def is_late_failure(reason: str) -> bool:
+        markers = (
+            "breakout fail",
+            "stop too wide",
+            "lod rule fails",
+            "invalid stop",
+            "volume not strong enough",
+            "volume unavailable",
+        )
+        r = (reason or "").lower()
+        return any(m in r for m in markers)
+
+    def is_early_failure(reason: str) -> bool:
+        markers = (
+            "trend fail",
+            "not a momentum leader",
+            "atr% too low",
+            "no valid",
+            "vcp fail",
+            "3wt fail",
+            "not enough data",
+            "window too small",
+            "segments too small",
+            "invalid price data",
+        )
+        r = (reason or "").lower()
+        return any(m in r for m in markers)
+
     for r in setup_results:
         if not r:
             continue
@@ -270,26 +303,29 @@ def build_debug_summary(setup_results: list[dict], chosen_setup: str) -> str:
         if not setup or setup == chosen_setup:
             continue
 
-        # Include WATCH always as "close"
-        if sig == "WATCH":
-            items.append(f"{setup}: WATCH ({reason})")
+        # Skip noise
+        if reason.lower() in {"setup disabled", "disabled"}:
             continue
 
-        # Include late-stage PASS reasons
-        late_markers = (
-            "breakout fail",
-            "Stop too wide",
-            "LOD rule fails",
-            "Invalid stop",
-            "volume not strong enough",
-        )
-        if sig == "PASS" and any(m.lower() in reason.lower() for m in late_markers):
-            items.append(f"{setup}: {reason}")
+        if sig == "WATCH":
+            watch_items.append(f"{setup}: WATCH ({reason})")
+        elif sig == "PASS":
+            if is_late_failure(reason):
+                late_items.append(f"{setup}: {reason}")
+            elif is_early_failure(reason):
+                early_items.append(f"{setup}: {reason}")
 
-    # Keep it short
-    if not items:
-        return ""
-    return " | ".join(items[:3])
+    items: list[str] = []
+    for bucket in (watch_items, late_items, early_items):
+        for it in bucket:
+            if it not in items:
+                items.append(it)
+            if len(items) >= max_items:
+                break
+        if len(items) >= max_items:
+            break
+
+    return " | ".join(items) if items else ""
 
 
 def eval_base_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> dict:
@@ -507,13 +543,13 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, lead
     )
     cons = df.iloc[-(best["cons_len"] + 1):-1]
     tr_cons = (cons["high"] - cons["low"]).abs().mean() if not cons.empty else np.nan
-    tr_ok = (not np.isnan(tr_cons)) and tr_today >= tr_cons * tr_mult
+    tr_ok = (not np.isnan(tr_cons)) and tr_today >= tr_cons * float(qcfg.get("tr_multiplier", 1.1))
 
     vol_ok = True
     if "volume" in df.columns and df["volume"].notna().any():
         cons_vol = cons["volume"].mean()
         if not np.isnan(cons_vol) and cons_vol > 0 and not np.isnan(last.get("volume", np.nan)):
-            vol_ok = last["volume"] >= cons_vol * vol_mult
+            vol_ok = last["volume"] >= cons_vol * float(qcfg.get("vol_multiplier", 1.1))
 
     if not breakout_ok:
         out["signal"] = "WATCH"
@@ -558,15 +594,6 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series, lead
 
 
 def minervini_trend_template_ok(df: pd.DataFrame, cfg: dict, last: pd.Series, rs_ok: bool) -> tuple[bool, str]:
-    """
-    Deterministic Minervini Trend Template:
-      - Close > SMA50
-      - SMA50 > SMA150 > SMA200
-      - SMA200 rising: today > 20 trading days ago
-      - Near 52w high (reuse near_52w_high_pct)
-      - Off lows: close >= 52w low * min_above_52w_low_mult
-      - Optional RS proxy within scanned list
-    """
     mcfg = cfg.get("minervini", {}) or {}
     if not bool(mcfg.get("enabled", True)):
         return False, "Minervini disabled"
@@ -636,7 +663,6 @@ def eval_minervini_vcp(df: pd.DataFrame, cfg: dict, last: pd.Series, rs_ok: bool
         out["reason"] = "VCP window too small"
         return out
 
-    # 3 segments: early/mid/late
     n = len(win)
     seg_len = n // 3
     if seg_len < 5:
@@ -666,7 +692,6 @@ def eval_minervini_vcp(df: pd.DataFrame, cfg: dict, last: pd.Series, rs_ok: bool
         out["reason"] = f"VCP fail: final range too wide ({r3:.1f}% > {final_max:.1f}%)"
         return out
 
-    # Volume dry-up: late avg <= early avg * mult
     dry_mult = float(scfg.get("vcp_vol_dryup_mult", 0.8))
     v1 = float(early["volume"].mean())
     v3 = float(late["volume"].mean())
@@ -679,14 +704,12 @@ def eval_minervini_vcp(df: pd.DataFrame, cfg: dict, last: pd.Series, rs_ok: bool
     entry = pivot * (1 + buffer_pct / 100.0)
     breakout_ok = last["close"] > entry
 
-    # Breakout volume confirmation
     vol_mult = float(scfg.get("vcp_breakout_vol_mult", 1.5))
     vol20 = float(df["volume"].rolling(20).mean().iloc[-1])
     vol_ok = False
     if not np.isnan(last.get("volume", np.nan)) and vol20 > 0:
         vol_ok = float(last["volume"]) >= vol20 * vol_mult
 
-    # Stop: late segment low vs ATR stop
     atr_mult = float(scfg.get("atr_stop_mult", 2.0))
     atr_val = last.get("atr", np.nan)
     stop_swing = float(late["low"].min())
@@ -755,7 +778,6 @@ def eval_minervini_3wt(df: pd.DataFrame, cfg: dict, last: pd.Series, rs_ok: bool
         return out
 
     close_pos = float(scfg.get("twt_week_close_pos", 0.6))
-    # 3 chunks of 5 bars
     for i in range(3):
         wk = win.iloc[i * 5:(i + 1) * 5]
         wk_high = float(wk["high"].max())
@@ -854,7 +876,7 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict, qull_leader_ok: bool, min_rs_ok:
 
     best = pick_best(setup_results)
     best_setup = (best.get("setup") or "").strip()
-    best["debug"] = build_debug_summary(setup_results, best_setup)
+    best["debug"] = build_debug_summary(setup_results, best_setup, max_items=3)
     return best
 
 
@@ -995,14 +1017,15 @@ def main():
     for sym in tickers:
         df = df_map.get(sym, pd.DataFrame())
         if df is None or df.empty:
-            results.append((sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": err_map.get(sym, "No data"), "debug": ""}))
+            results.append(
+                (sym, {"signal": "PASS", "setup": "", "score": 0, "entry": "", "stop": "", "reason": err_map.get(sym, "No data"), "debug": ""})
+            )
             continue
         res = analyse_symbol(df, cfg, qull_flags.get(sym, False), rs_flags.get(sym, True))
         results.append((sym, res))
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # Signals now has one extra column -> set cols >= 13
     ws_signals = upsert_worksheet(sh, "Signals", rows=max(1000, len(results) + 10), cols=14)
     ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=500, cols=12)
     ws_watch = upsert_worksheet(sh, "WATCH", rows=1000, cols=12)
