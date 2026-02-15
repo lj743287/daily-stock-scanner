@@ -55,6 +55,7 @@ def normalise_timeseries_payload(symbol: str, payload: dict) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(values)
+
     for col in ["open", "high", "low", "close", "volume"]:
         if col in df.columns:
             df[col] = df[col].map(safe_float)
@@ -110,15 +111,20 @@ def analyse_symbol(df: pd.DataFrame, cfg: dict) -> dict:
     else:
         sma200_up = False
 
-    trend_ok = (
-        last["close"] > last["sma50"] > last["sma150"] > last["sma200"]
-        and sma200_up
-        and near_52w_ok
-        and liquidity_ok
-    )
+    ma_stack_ok = (last["close"] > last["sma50"] > last["sma150"] > last["sma200"])
+    trend_ok = (ma_stack_ok and sma200_up and near_52w_ok and liquidity_ok)
 
     if not trend_ok:
-        out["reason"] = "Trend filter failed"
+        fails = []
+        if not ma_stack_ok:
+            fails.append("MA stack")
+        if not sma200_up:
+            fails.append("200MA not rising")
+        if not near_52w_ok:
+            fails.append("not near 52w high")
+        if not liquidity_ok:
+            fails.append("liquidity")
+        out["reason"] = "Trend fail: " + ", ".join(fails)
         return out
 
     base_n = cfg["setup_base_breakout"]["base_lookback"]
@@ -263,7 +269,16 @@ def main():
     for sym, res in results:
         if res["signal"] == "BUY_NOW":
             buy_count += 1
-        rows.append([sym, res.get("signal", ""), res.get("setup", ""), res.get("score", 0), res.get("entry", ""), res.get("stop", ""), res.get("reason", ""), now_utc])
+        rows.append([
+            sym,
+            res.get("signal", ""),
+            res.get("setup", ""),
+            res.get("score", 0),
+            res.get("entry", ""),
+            res.get("stop", ""),
+            res.get("reason", ""),
+            now_utc,
+        ])
 
     ws_signals.clear()
     ws_signals.update("A1", rows)
