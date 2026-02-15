@@ -284,7 +284,7 @@ def build_debug_summary(setup_results: list[dict], chosen_setup: str, max_items:
             "segments too small",
             "invalid price data",
             "volume unavailable",
-            "no valid ma-surf",
+            "ma-surf",
         )
         r = (reason or "").lower()
         return any(m in r for m in markers)
@@ -397,11 +397,13 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> d
     """
     Qullamaggie Breakout (daily-only):
       - Impulse leg within lookback: impulse_min_pct rise from swing low to swing high
-      - Consolidation 2-9-ish weeks:
+      - Consolidation:
           - depth <= cons_depth_max_pct
           - higher lows (last third low > first third low)
-          - surfing: % closes above EMA20 >= surf_pct
-          - EMA10 and EMA20 rising into end of consolidation (yesterday vs N days ago)
+          - surfing: % closes above ONE of EMA10/EMA20/EMA50 >= surf_pct
+          - MA(s) rising into end of consolidation:
+              - EMA20 must be rising
+              - and the surf EMA must be rising (EMA10 or EMA20 or EMA50)
       - Entry: break above consolidation high + buffer
       - Stop on breakout day: Low of Day; must not exceed ATR * stop_max_atr_mult
     Momentum leader filter is REMOVED (you will screen that).
@@ -432,13 +434,21 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> d
     cons_max = int(qcfg.get("cons_max_bars", 45))
     cons_depth_max_pct = float(qcfg.get("cons_depth_max_pct", 25.0))
 
-    surf_pct = float(qcfg.get("surf_close_above_ema20_pct", qcfg.get("surf_close_above_sma20_pct", 0.6)))
+    # Supports old key surf_close_above_ema20_pct and new generic surf_close_above_ema_pct
+    surf_pct = float(qcfg.get("surf_close_above_ema_pct", qcfg.get("surf_close_above_ema20_pct", 0.6)))
     ma_rise_lookback = int(qcfg.get("ma_rise_lookback", 3))
 
     breakout_buffer_pct = float(qcfg.get("breakout_buffer_pct", 0.05))
     vol_mult = float(qcfg.get("vol_multiplier", 1.1))
     tr_mult = float(qcfg.get("tr_multiplier", 1.1))
     stop_max_atr_mult = float(qcfg.get("stop_max_atr_mult", 1.2))
+
+    # Allow surf on ANY of these EMAs
+    surf_mas = [
+        ("EMA10", "ema10", 3),  # prefer faster MA if equal
+        ("EMA20", "ema20", 2),
+        ("EMA50", "ema50", 1),
+    ]
 
     best = None
     fail_counts = {"depth": 0, "higher_lows": 0, "surf": 0, "ma_rise": 0, "impulse": 0, "pullback": 0, "data": 0}
@@ -473,25 +483,37 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> d
             fail_counts["higher_lows"] += 1
             continue
 
-        # Surfing: closes above EMA20
-        if "ema20" not in cons.columns or cons["ema20"].isna().all():
-            fail_counts["data"] += 1
-            continue
-        frac_above = float((cons["close"] >= cons["ema20"]).mean())
-        if frac_above < surf_pct:
+        # Pick the best surf MA that meets the surf threshold
+        surf_candidates = []
+        for ma_name, col, pref in surf_mas:
+            if col not in cons.columns or cons[col].isna().all():
+                continue
+            frac_above = float((cons["close"] >= cons[col]).mean())
+            if frac_above >= surf_pct:
+                surf_candidates.append((frac_above, pref, ma_name, col))
+
+        if not surf_candidates:
             fail_counts["surf"] += 1
             continue
 
-        # EMA10/EMA20 rising into end of consolidation (yesterday vs N days ago)
-        idx_end = len(df) - 2
+        # Choose: highest frac_above, then prefer EMA10 > EMA20 > EMA50
+        surf_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best_frac_above, _, best_ma_name, best_ma_col = surf_candidates[0]
+
+        # MA rise check: EMA20 must be rising AND surf MA must be rising (could be EMA20)
+        idx_end = len(df) - 2  # yesterday
         idx_prev = idx_end - ma_rise_lookback
         if idx_prev < 0:
             fail_counts["data"] += 1
             continue
-        if df["ema10"].iloc[idx_end] <= df["ema10"].iloc[idx_prev]:
+
+        # EMA20 rising (anchor)
+        if df["ema20"].iloc[idx_end] <= df["ema20"].iloc[idx_prev]:
             fail_counts["ma_rise"] += 1
             continue
-        if df["ema20"].iloc[idx_end] <= df["ema20"].iloc[idx_prev]:
+
+        # Surf MA rising
+        if df[best_ma_col].iloc[idx_end] <= df[best_ma_col].iloc[idx_prev]:
             fail_counts["ma_rise"] += 1
             continue
 
@@ -525,7 +547,7 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> d
             continue
 
         tight_bonus = int(max(0, min(25, (cons_depth_max_pct - depth_pct) * 1.5)))
-        surf_bonus = int(max(0, min(10, (frac_above - surf_pct) * 20)))
+        surf_bonus = int(max(0, min(10, (best_frac_above - surf_pct) * 20)))
         cand_score = 60 + tight_bonus + surf_bonus
 
         cand = {
@@ -533,7 +555,9 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> d
             "cons_high": float(cons_high),
             "cons_low": float(cons_low),
             "depth_pct": float(depth_pct),
-            "frac_above": float(frac_above),
+            "frac_above": float(best_frac_above),
+            "surf_ma_name": best_ma_name,
+            "surf_ma_col": best_ma_col,
             "impulse_pct": float(impulse_pct),
             "score_base": int(min(85, cand_score)),
         }
@@ -542,13 +566,12 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> d
             best = cand
 
     if best is None:
-        # Deterministic "best guess" why we couldn't find a valid pattern
         top_fail = max(fail_counts.items(), key=lambda kv: kv[1])[0]
         reason_map = {
             "depth": "consolidation too deep",
             "higher_lows": "higher-lows test failed",
-            "surf": "not surfing EMA20 enough",
-            "ma_rise": "EMA10/EMA20 not rising",
+            "surf": "not surfing EMA10/20/50 enough",
+            "ma_rise": "EMA rise test failed",
             "impulse": "impulse leg rule not met",
             "pullback": "pullback too deep vs impulse high",
             "data": "insufficient/invalid data in windows",
@@ -581,7 +604,7 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> d
         out["entry"] = f"{entry:.2f}"
         out["stop"] = f"{best['cons_low']:.2f}"
         out["score"] = int(min(100, best["score_base"]))
-        out["reason"] = f"Impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d MA-surf (EMA20), no breakout yet"
+        out["reason"] = f"Impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d MA-surf ({best['surf_ma_name']}), no breakout yet"
         return out
 
     # Breakout day stop rule: LOD, with ATR width constraint
@@ -608,7 +631,7 @@ def eval_qullamaggie_breakout(df: pd.DataFrame, cfg: dict, last: pd.Series) -> d
     out["entry"] = f"{entry:.2f}"
     out["stop"] = f"{stop:.2f}"
     out["reason"] = (
-        f"Impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d MA-surf (EMA20), broke range"
+        f"Impulse {best['impulse_pct']:.0f}%, tight {best['cons_len']}d MA-surf ({best['surf_ma_name']}), broke range"
         + (", volume ok" if vol_ok else ", volume weak")
         + (", range expanded" if tr_ok else "")
     )
