@@ -13,13 +13,34 @@ TD_BASE = "https://api.twelvedata.com/time_series"
 
 
 def read_tickers(path: str) -> list[str]:
+    # Accepts either:
+    # 1) One ticker per line: AAPL
+    # 2) TradingView export: NYSE:AA,NASDAQ:MSFT,...
     tickers = []
+    seen = set()
+
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            t = line.strip().upper()
-            if t and not t.startswith("#"):
-                tickers.append(t)
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Split both comma-separated and line-separated inputs
+            parts = [p.strip() for p in line.split(",") if p.strip()]
+
+            for p in parts:
+                if p.startswith("#"):
+                    continue
+
+                # Strip exchange prefix if present, e.g. NASDAQ:MSFT -> MSFT
+                sym = p.split(":")[-1].strip().upper()
+
+                if sym and sym not in seen:
+                    tickers.append(sym)
+                    seen.add(sym)
+
     return tickers
+
 
 
 def chunks(items: list[str], n: int) -> list[list[str]]:
