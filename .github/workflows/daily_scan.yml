@@ -3,7 +3,7 @@ name: Daily Stock Scanner
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 22 * * 1-5"
+    - cron: "35 21 * * 1-5"
 
 jobs:
   scan:
