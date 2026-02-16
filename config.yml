@@ -1,3 +1,4 @@
+# config.yml
 api:
   interval: 1day
 
@@ -11,6 +12,19 @@ api:
   # Provider per-minute cap (Grow 55 == 55 credits/min)
   max_api_credits_per_min: 50
 
+# Hard filters to avoid junk/OTC/illiquid names that fool pivot logic
+filters:
+  # If set, only these exchanges are scanned (MSFT:NASDAQ -> NASDAQ)
+  allowed_exchanges: [NASDAQ, NYSE, AMEX, NYSEARCA, ARCA, BATS, IEX]
+
+  # Always exclude these even if allowed_exchanges is empty
+  exclude_exchanges: [OTC]
+
+  # Liquidity (set to 0 to disable each)
+  min_price: 5.0
+  min_avg_volume_20d: 0
+  min_avg_dollar_vol_20d: 1000000
+
 vcp:
   # -------------------------
   # Base window (weeks)
@@ -22,18 +36,25 @@ vcp:
   prefer_base_weeks_min: 6
   prefer_base_weeks_max: 12
 
-  # The "left-side high" must occur in the left portion of the base window (loosened)
-  left_high_max_pos_frac: 0.50
+  # The "left-side high" must occur in the left portion of the base window
+  left_high_max_pos_frac: 0.40
 
-  # "in base" rule: price must not make a decisive new high above the left-side high (loosened)
-  base_top_overshoot_tol_pct: 1.5
+  # "in base" rule: price must not make a decisive new high above the left-side high
+  base_top_overshoot_tol_pct: 0.50
 
   # -------------------------
-  # Prior uptrend context (no MAs) (loosened)
+  # Prior uptrend context (no MAs)
   # -------------------------
   pretrend_bars: 100
-  min_pretrend_return_pct: 10
+  min_pretrend_return_pct: 15
   require_positive_pretrend_slope: true
+
+  # -------------------------
+  # Context: keep bases in the upper part of the overall range
+  # -------------------------
+  context:
+    high_lookback_bars: 252
+    max_dist_from_52w_high_pct: 25.0
 
   # -------------------------
   # Contractions (T count)
@@ -44,14 +65,14 @@ vcp:
   # Reject very messy bases
   reject_if_contractions_gt: 8
 
-  # Shrinking logic (loosened per your instructions)
+  # Shrinking logic (loosened per your request)
   shrink_step_mult: 0.92
   shrink_steps_min_frac: 0.45
   allow_one_exception: true
   exception_step_mult: 1.20
   last_vs_first_max_mult: 0.70
 
-  # Final contraction tightness (loosened)
+  # Final contraction tightness (loosened per your request)
   max_last_contraction_pct: 15
 
   # Overall base depth from left-side high to base low (cap)
@@ -63,10 +84,12 @@ vcp:
   pivot_use_last_rebound_peak: true
   pivot_exclude_last_n_bars: 2
 
-  entry_buffer_pct: 0.20
-  near_breakout_pct: 8.0
+  # Constrain fallback pivot to a right-side lookback (prevents old highs causing late buys)
+  pivot:
+    max_lookback_bars: 60
 
-  # Risk cap REMOVED (no vcp.max_stop_pct_trade)
+  entry_buffer_pct: 0.20
+  near_breakout_pct: 3.0
 
   # -------------------------
   # Pivot detection (swing pivots)
@@ -76,39 +99,54 @@ vcp:
     right_bars_options: [3, 4, 5, 6, 7]
 
   # -------------------------
-  # Tightening on the right side (loosened)
+  # Tightening on the right side
   # -------------------------
   tightening:
     atr_len: 14
-    atrp_right_to_left_max: 0.90
+    atrp_right_to_left_max: 0.80
     atrp_right_to_left_pref: 0.70
 
     right_segment_bars: 15
-    right_range_max_pct: 10.0
-    right_range_max_pct_soft: 12.0
-    right_close_top_half_min_pct: 55.0
+    right_range_max_pct: 8.0
+    right_range_max_pct_soft: 10.0
+    right_close_top_half_min_pct: 60.0
 
   # -------------------------
-  # Volume behaviour (loosened)
+  # Volume behaviour
   # -------------------------
   volume:
     # "high volume rallies - low volume pullbacks"
-    min_rally_to_pullback_ratio: 0.90
+    min_rally_to_pullback_ratio: 1.00
 
-    # "low volume out - high volume in" violation proxy (loosened)
-    bearish_pullback_to_rally_ratio: 1.25
+    # "low volume out - high volume in" violation proxy
+    bearish_pullback_to_rally_ratio: 1.15
 
     min_pairs_required: 1
 
   # -------------------------
-  # Breakout confirmation (loosened)
+  # Breakout confirmation (actionability upgrades)
   # -------------------------
   breakout:
     # price_trigger: close OR high
-    price_trigger: high
-    breakout_vol_mult: 1.10
-    breakout_vol_ma: 20
+    price_trigger: close
+
+    # Breakout volume confirmation (if weak -> default WATCH not PASS)
+    breakout_vol_mult: 1.20
+    breakout_vol_ma: 50
     breakout_vol_min: 0
+    volume_action_if_weak: watch  # watch|pass
+
+    # Only call BUY on the first cross above entry (prevents late buys)
+    require_fresh_cross: true
+
+    # Avoid "extended" buys far above the pivot
+    max_close_extension_pct: 2.5
+    max_high_extension_pct: 4.0
+
+    # Gap / event-day handling (downgrade or reject)
+    max_gap_up_pct: 8.0
+    max_breakout_day_range_pct: 12.0
+    gap_action: watch  # watch|pass
 
   # -------------------------
   # Optional handle sweet spot
@@ -120,16 +158,16 @@ vcp:
     max_chop_range_pct: 6.0
 
   # -------------------------
-  # Fail filters (loosened)
+  # Fail filters
   # -------------------------
   fail_filters:
-    # If max contraction depth is less than this, treat as a grind up, not a base (loosened)
-    min_meaningful_contraction_pct: 5.0
+    # If max contraction depth is less than this, treat as a grind up, not a base
+    min_meaningful_contraction_pct: 7.0
 
-    # Right-side volatility expansion: last contraction too big vs previous (loosened)
-    max_last_depth_vs_prev_mult: 1.35
+    # Right-side volatility expansion: last contraction too big vs previous
+    max_last_depth_vs_prev_mult: 1.20
 
-    # Wide-range down bars on right side (loosened)
-    wide_down_bars_min: 3
-    wide_down_tr_mult: 1.75
+    # Wide-range down bars on right side
+    wide_down_bars_min: 2
+    wide_down_tr_mult: 1.50
     right_fail_lookback_bars: 15
