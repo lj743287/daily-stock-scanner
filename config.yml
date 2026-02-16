@@ -22,17 +22,17 @@ vcp:
   prefer_base_weeks_min: 6
   prefer_base_weeks_max: 12
 
-  # The "left-side high" must occur in the left portion of the base window
-  left_high_max_pos_frac: 0.40
+  # The "left-side high" must occur in the left portion of the base window (loosened)
+  left_high_max_pos_frac: 0.50
 
-  # "in base" rule: price must not make a decisive new high above the left-side high
-  base_top_overshoot_tol_pct: 0.50
+  # "in base" rule: price must not make a decisive new high above the left-side high (loosened)
+  base_top_overshoot_tol_pct: 1.5
 
   # -------------------------
-  # Prior uptrend context (no MAs)
+  # Prior uptrend context (no MAs) (loosened)
   # -------------------------
   pretrend_bars: 100
-  min_pretrend_return_pct: 15
+  min_pretrend_return_pct: 10
   require_positive_pretrend_slope: true
 
   # -------------------------
@@ -44,15 +44,15 @@ vcp:
   # Reject very messy bases
   reject_if_contractions_gt: 8
 
-  # Shrinking logic (your research)
-  shrink_step_mult: 0.85
-  shrink_steps_min_frac: 0.60
+  # Shrinking logic (loosened per your instructions)
+  shrink_step_mult: 0.92
+  shrink_steps_min_frac: 0.45
   allow_one_exception: true
   exception_step_mult: 1.20
-  last_vs_first_max_mult: 0.60
+  last_vs_first_max_mult: 0.70
 
-  # Final contraction tightness
-  max_last_contraction_pct: 12
+  # Final contraction tightness (loosened)
+  max_last_contraction_pct: 15
 
   # Overall base depth from left-side high to base low (cap)
   max_base_depth_pct: 50
@@ -64,10 +64,9 @@ vcp:
   pivot_exclude_last_n_bars: 2
 
   entry_buffer_pct: 0.20
-  near_breakout_pct: 3.0
+  near_breakout_pct: 8.0
 
-  # Risk cap
-  max_stop_pct_trade: 10.0
+  # Risk cap REMOVED (no vcp.max_stop_pct_trade)
 
   # -------------------------
   # Pivot detection (swing pivots)
@@ -77,38 +76,38 @@ vcp:
     right_bars_options: [3, 4, 5, 6, 7]
 
   # -------------------------
-  # Tightening on the right side
+  # Tightening on the right side (loosened)
   # -------------------------
   tightening:
     atr_len: 14
-    atrp_right_to_left_max: 0.80
+    atrp_right_to_left_max: 0.90
     atrp_right_to_left_pref: 0.70
 
     right_segment_bars: 15
-    right_range_max_pct: 8.0
-    right_range_max_pct_soft: 10.0
-    right_close_top_half_min_pct: 60.0
+    right_range_max_pct: 10.0
+    right_range_max_pct_soft: 12.0
+    right_close_top_half_min_pct: 55.0
 
   # -------------------------
-  # Volume behaviour
+  # Volume behaviour (loosened)
   # -------------------------
   volume:
     # "high volume rallies - low volume pullbacks"
-    min_rally_to_pullback_ratio: 1.00
+    min_rally_to_pullback_ratio: 0.90
 
-    # "low volume out - high volume in" violation proxy
-    bearish_pullback_to_rally_ratio: 1.15
+    # "low volume out - high volume in" violation proxy (loosened)
+    bearish_pullback_to_rally_ratio: 1.25
 
     min_pairs_required: 1
 
   # -------------------------
-  # Breakout confirmation
+  # Breakout confirmation (loosened)
   # -------------------------
   breakout:
     # price_trigger: close OR high
-    price_trigger: close
-    breakout_vol_mult: 1.20
-    breakout_vol_ma: 50
+    price_trigger: high
+    breakout_vol_mult: 1.10
+    breakout_vol_ma: 20
     breakout_vol_min: 0
 
   # -------------------------
@@ -121,16 +120,16 @@ vcp:
     max_chop_range_pct: 6.0
 
   # -------------------------
-  # Fail filters
+  # Fail filters (loosened)
   # -------------------------
   fail_filters:
-    # If max contraction depth is less than this, treat as a grind up, not a base
-    min_meaningful_contraction_pct: 7.0
+    # If max contraction depth is less than this, treat as a grind up, not a base (loosened)
+    min_meaningful_contraction_pct: 5.0
 
-    # Right-side volatility expansion: last contraction too big vs previous
-    max_last_depth_vs_prev_mult: 1.20
+    # Right-side volatility expansion: last contraction too big vs previous (loosened)
+    max_last_depth_vs_prev_mult: 1.35
 
-    # Wide-range down bars on right side
-    wide_down_bars_min: 2
-    wide_down_tr_mult: 1.50
+    # Wide-range down bars on right side (loosened)
+    wide_down_bars_min: 3
+    wide_down_tr_mult: 1.75
     right_fail_lookback_bars: 15
