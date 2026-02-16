@@ -994,7 +994,7 @@ def rate_limit_wait(batch_credits: int, max_credits_per_min: int, state: dict) -
         state["used"] = used + batch_credits
         return
 
-    sleep_s = max(0.0, 60.0 - elapsed) + 0.2
+    sleep_s = max(0.0, 60.0 - elapsed) + 1.2
     time.sleep(sleep_s)
 
     state["window_start"] = time.monotonic()
