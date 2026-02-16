@@ -6,10 +6,10 @@ api:
   outputsize: 520
 
   # Batch symbols per API call (1 symbol ~= 1 credit)
-  batch_size: 55
+  batch_size: 50
 
   # Provider per-minute cap (Grow 55 == 55 credits/min)
-  max_api_credits_per_min: 55
+  max_api_credits_per_min: 50
 
 vcp:
   # -------------------------
