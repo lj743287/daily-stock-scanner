@@ -1,151 +1,136 @@
 api:
   interval: 1day
-  outputsize: 260
+
+  # VCP scanning needs enough history for up to 60 weeks + pretrend context
+  # 60w ~ 300 bars, pretrend ~ 100 bars, plus buffer => ~520
+  outputsize: 520
+
+  # Batch symbols per API call (1 symbol ~= 1 credit)
   batch_size: 55
+
+  # Provider per-minute cap (Grow 55 == 55 credits/min)
   max_api_credits_per_min: 55
 
-indicators:
-  ema_fast: 10
-  ema_mid: 20
-  ema_slow: 50
-  sma_fast: 50
-  sma_mid: 150
-  sma_slow: 200
-  atr_len: 14
+vcp:
+  # -------------------------
+  # Base window (weeks)
+  # -------------------------
+  min_base_weeks: 3
+  max_base_weeks: 60
 
-filters:
-  near_52w_high_pct: 25
+  # Scoring preference (boost)
+  prefer_base_weeks_min: 6
+  prefer_base_weeks_max: 12
 
-# 1) Qullamaggie Base Breakout (proper base)
-setup_qullamaggie_breakout:
-  enabled: true
-  impulse_lookback: 60
-  impulse_min_pct: 30
+  # The "left-side high" must occur in the left portion of the base window
+  left_high_max_pos_frac: 0.40
 
-  # Base window (ends yesterday)
-  cons_min_bars: 10
-  cons_max_bars: 40
+  # "in base" rule: price must not make a decisive new high above the left-side high
+  base_top_overshoot_tol_pct: 0.50
 
-  # You asked to remove the fixed depth requirement (range not too wide), so this is OFF by default
-  enforce_depth: false
-  cons_max_depth_pct: 15
+  # -------------------------
+  # Prior uptrend context (no MAs)
+  # -------------------------
+  pretrend_bars: 100
+  min_pretrend_return_pct: 15
+  require_positive_pretrend_slope: true
 
-  # Keep it from being a runaway trend (should base/pull back and then tighten)
-  cons_max_up_drift_pct: 10
-  cons_max_down_drift_pct: 10
-  cons_low_must_be_early_pct: 0.60
-  tightening_ratio_max: 0.90
-  higher_low_tol_pct: 2
+  # -------------------------
+  # Contractions (T count)
+  # -------------------------
+  min_contractions: 2
+  max_contractions: 6
 
-  # Surfing MA logic (support on 10/20/50)
-  surf_close_min_pct: 70
-  surf_max_dist_pct: 6
-  ma_slope_lookback: 5
+  # Reject very messy bases
+  reject_if_contractions_gt: 8
 
-  # NEW: require actual MA interaction (touches) to stop false positives
-  surf_touch_min_count: 2
-  surf_touch_tol_pct: 1.0
+  # Shrinking logic (your research)
+  shrink_step_mult: 0.85
+  shrink_steps_min_frac: 0.60
+  allow_one_exception: true
+  exception_step_mult: 1.20
+  last_vs_first_max_mult: 0.60
 
-  breakout_buffer_pct: 0.2
-  pivot_exclude_last_n: 2
+  # Final contraction tightness
+  max_last_contraction_pct: 12
 
-  # Extended / risk sanity
-  max_ext_pct_above_surf_ma: 8
-  max_ext_atr_mult_above_surf_ma: 3
-  max_breakout_extension_pct: 4
-  stop_width_atr_mult: 1.0
-
-# 2) Qullamaggie Staircase Pullback
-setup_qullamaggie_staircase:
-  enabled: true
-
-  # Pullback window (ends yesterday)
-  pullback_min_bars: 3
-  pullback_max_bars: 12
-
-  # Impulse leg definition
-  impulse_lookback: 25
-  impulse_min_pct: 15
-  peak_lookback: 5
-
-  # Your rule: must not retrace deeper than 78.6% of the impulse
-  fib_retrace_max: 0.786
-
-  # Controlled pullback (not a wild chop) - adjust if too strict
-  pullback_max_range_pct: 10
-  pullback_max_drift_pct: 6
-
-  # Surfing MA (EMA10/EMA20)
-  surf_close_min_pct: 60
-  surf_touch_min_count: 1
-  surf_touch_tol_pct: 1.0
-
-  breakout_buffer_pct: 0.2
-  pivot_exclude_last_n: 2
-
-  # Extended / risk sanity
-  max_breakout_extension_pct: 4
-  max_ext_pct_above_surf_ma: 10
-  max_ext_atr_mult_above_surf_ma: 4
-  stop_width_atr_mult: 1.2
-
-# B) Minervini VCP (Volatility Contraction Pattern) - revised logic
-setup_minervini_vcp:
-  enabled: true
-
-  # Base length (weeks)
-  base_weeks_min: 3
-  base_weeks_max: 60
-  base_weeks_pref_min: 6
-  base_weeks_pref_max: 12
-
-  # Left-side high logic
-  left_side_max_pos_pct: 0.25
-  left_high_overshoot_tol_pct: 1.0
-
-  # Pivots (swings) used for contractions
-  pivot_left_bars: 5
-  pivot_right_bars: 5
-
-  # Contractions
-  contractions_min: 2
-  contractions_max: 6
-  contractions_pref_min: 3
-  contractions_pref_max: 4
-
-  # You changed this from 35% to 50%
+  # Overall base depth from left-side high to base low (cap)
   max_base_depth_pct: 50
 
-  # Depth contraction rule (messy but directional)
-  depth_shrink_mult: 0.85
-  depth_shrink_min_steps_frac: 0.60
-  depth_allow_one_bump_pct: 20
-  d_last_vs_first_mult: 0.60
-  d_last_max_pct: 12
+  # -------------------------
+  # Pivot / entry
+  # -------------------------
+  pivot_use_last_rebound_peak: true
+  pivot_exclude_last_n_bars: 2
 
-  # Prevent "it's just going up" (needs meaningful pullbacks)
-  meaningful_pullback_min_pct: 6
+  entry_buffer_pct: 0.20
+  near_breakout_pct: 3.0
 
-  # Tightening rules
-  atrp_compress_req: 0.80
-  atrp_compress_pref: 0.70
-  right_segment_bars_min: 10
-  right_segment_bars_max: 20
-  right_range_max_pct: 8
-  right_close_top_half_min_pct: 60
+  # Risk cap
+  max_stop_pct_trade: 10.0
 
-  # Entry / WATCH
-  breakout_buffer_pct: 0.2
-  near_breakout_pct: 3
-  pivot_lookback_bars: 15
-  pivot_exclude_last_n: 5
+  # -------------------------
+  # Pivot detection (swing pivots)
+  # -------------------------
+  pivots:
+    left_bars_options: [3, 4, 5, 6, 7]
+    right_bars_options: [3, 4, 5, 6, 7]
 
-  # Extended filters
-  max_breakout_extension_pct: 4
-  max_ext_above_sma50_pct: 12
+  # -------------------------
+  # Tightening on the right side
+  # -------------------------
+  tightening:
+    atr_len: 14
+    atrp_right_to_left_max: 0.80
+    atrp_right_to_left_pref: 0.70
 
-  # Scoring bonus (optional)
-  vol_dryup_mult: 0.85
+    right_segment_bars: 15
+    right_range_max_pct: 8.0
+    right_range_max_pct_soft: 10.0
+    right_close_top_half_min_pct: 60.0
 
-  # Fail filter: right-side volatility expansion
-  right_vol_expand_bump_pct: 20
+  # -------------------------
+  # Volume behaviour
+  # -------------------------
+  volume:
+    # "high volume rallies - low volume pullbacks"
+    min_rally_to_pullback_ratio: 1.00
+
+    # "low volume out - high volume in" violation proxy
+    bearish_pullback_to_rally_ratio: 1.15
+
+    min_pairs_required: 1
+
+  # -------------------------
+  # Breakout confirmation
+  # -------------------------
+  breakout:
+    # price_trigger: close OR high
+    price_trigger: close
+    breakout_vol_mult: 1.20
+    breakout_vol_ma: 50
+    breakout_vol_min: 0
+
+  # -------------------------
+  # Optional handle sweet spot
+  # -------------------------
+  handle:
+    enabled: true
+    last_low_min_pos_frac: 0.60
+    min_chop_bars: 5
+    max_chop_range_pct: 6.0
+
+  # -------------------------
+  # Fail filters
+  # -------------------------
+  fail_filters:
+    # If max contraction depth is less than this, treat as a grind up, not a base
+    min_meaningful_contraction_pct: 7.0
+
+    # Right-side volatility expansion: last contraction too big vs previous
+    max_last_depth_vs_prev_mult: 1.20
+
+    # Wide-range down bars on right side
+    wide_down_bars_min: 2
+    wide_down_tr_mult: 1.50
+    right_fail_lookback_bars: 15
