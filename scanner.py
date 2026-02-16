@@ -111,7 +111,7 @@ def display_ticker(sym: str) -> str:
 
 
 def get_exchange(sym: str) -> str:
-    # MSFT:NASDAQ -> NASDAQ
+    # Convert MSFT:NASDAQ -> NASDAQ (empty if none)
     if ":" in sym:
         return sym.split(":", 1)[1].strip().upper()
     return ""
@@ -242,63 +242,6 @@ def pct_range(high_val: float, low_val: float, denom: float | None = None) -> fl
 
 
 # ---------------------------
-# Filters: exchange + liquidity
-# ---------------------------
-
-def exchange_allowed(sym: str, cfg: dict) -> tuple[bool, str]:
-    fcfg = cfg.get("filters", {}) or {}
-    allowed = [x.upper() for x in (fcfg.get("allowed_exchanges", []) or [])]
-    excluded = [x.upper() for x in (fcfg.get("exclude_exchanges", []) or [])]
-
-    ex = get_exchange(sym)
-    if ex and excluded and ex in excluded:
-        return False, f"Exchange excluded: {ex}"
-    if ex and allowed and ex not in allowed:
-        return False, f"Exchange not allowed: {ex}"
-    return True, ""
-
-
-def liquidity_ok(df_full: pd.DataFrame, cfg: dict) -> tuple[bool, str, dict]:
-    """
-    Basic tradability filters to avoid junk / illiquid names that can fool pivot logic.
-    """
-    fcfg = cfg.get("filters", {}) or {}
-    min_price = float(fcfg.get("min_price", 0.0))
-    min_avg_vol_20 = float(fcfg.get("min_avg_volume_20d", 0.0))
-    min_avg_dv_20 = float(fcfg.get("min_avg_dollar_vol_20d", 0.0))
-
-    if df_full is None or df_full.empty or len(df_full) < 60:
-        return False, "Not enough data for liquidity checks", {}
-
-    last_close = float(df_full["close"].iloc[-1])
-    if min_price > 0 and last_close < min_price:
-        return False, f"Price below minimum ({last_close:.2f} < {min_price:.2f})", {"last_close": last_close}
-
-    if "volume" not in df_full.columns or df_full["volume"].isna().all():
-        # If no volume exists, do not block by volume filters
-        return True, "Volume not available (liquidity filters ignored)", {"last_close": last_close}
-
-    vol20 = df_full["volume"].iloc[-20:].dropna()
-    if len(vol20) >= 10:
-        avg_vol_20 = float(vol20.mean())
-    else:
-        avg_vol_20 = float(df_full["volume"].dropna().tail(50).mean()) if df_full["volume"].notna().any() else np.nan
-
-    dv = (df_full["close"] * df_full["volume"]).iloc[-20:].dropna()
-    avg_dv_20 = float(dv.mean()) if len(dv) >= 10 else np.nan
-
-    stats = {"last_close": last_close, "avg_vol_20d": avg_vol_20, "avg_dollar_vol_20d": avg_dv_20}
-
-    if min_avg_vol_20 > 0 and not np.isnan(avg_vol_20) and avg_vol_20 < min_avg_vol_20:
-        return False, f"Average volume too low (20d {avg_vol_20:.0f} < {min_avg_vol_20:.0f})", stats
-
-    if min_avg_dv_20 > 0 and not np.isnan(avg_dv_20) and avg_dv_20 < min_avg_dv_20:
-        return False, f"Average $ volume too low (20d {avg_dv_20:,.0f} < {min_avg_dv_20:,.0f})", stats
-
-    return True, "Liquidity ok", stats
-
-
-# ---------------------------
 # Pivot / contraction logic
 # ---------------------------
 
@@ -375,7 +318,7 @@ def build_contractions(pivots: list[tuple[int, str, float]]) -> list[dict]:
     Each contraction i uses:
       peak = H_i
       trough = L_i
-      rebound_peak = H_{i+1} (if present) for volume-phase comparison
+      rebound_peak = H_{i+1} (if present)
     """
     piv = enforce_alternation(pivots)
     contractions: list[dict] = []
@@ -410,80 +353,16 @@ def build_contractions(pivots: list[tuple[int, str, float]]) -> list[dict]:
 
 
 # ---------------------------
-# VCP evaluation blocks
+# Tightening + fail filters (no volume gating)
 # ---------------------------
-
-def volume_character_ok(df: pd.DataFrame, contractions: list[dict], cfg: dict) -> tuple[bool, str, dict]:
-    """
-    Implements: "high volume rallies - low volume pullbacks"
-    For each contraction with a rebound:
-      - pullback leg = peak -> trough
-      - rally leg    = trough -> rebound peak
-    Condition: avg(rally vol) / avg(pullback vol) >= min_ratio
-
-    Also implements bearish violation proxy:
-      - if pullback vol dominates rally vol repeatedly ("low vol out / high vol in")
-    """
-    vcfg = cfg.get("vcp", {}).get("volume", {}) or {}
-    min_ratio = float(vcfg.get("min_rally_to_pullback_ratio", 1.0))
-    bearish_ratio = float(vcfg.get("bearish_pullback_to_rally_ratio", 1.15))
-    min_pairs = int(vcfg.get("min_pairs_required", 1))
-
-    if "volume" not in df.columns or df["volume"].isna().all():
-        return True, "Volume not available (ignored)", {"pairs": 0}
-
-    vols = df["volume"].values
-    ok_pairs = 0
-    bearish_pairs = 0
-    ratios = []
-
-    for c in contractions:
-        p0 = int(c["peak_idx"])
-        t0 = int(c["trough_idx"])
-        r0 = c.get("rebound_idx", None)
-        if r0 is None or np.isnan(r0):
-            continue
-        r0 = int(r0)
-
-        if r0 <= t0 or t0 <= p0:
-            continue
-
-        pull = vols[p0:t0 + 1]
-        rally = vols[t0:r0 + 1]
-
-        pull_m = float(np.nanmean(pull)) if pull.size else np.nan
-        rally_m = float(np.nanmean(rally)) if rally.size else np.nan
-
-        if np.isnan(pull_m) or pull_m <= 0 or np.isnan(rally_m) or rally_m <= 0:
-            continue
-
-        ratio = rally_m / pull_m
-        ratios.append(ratio)
-
-        if ratio >= min_ratio:
-            ok_pairs += 1
-        if (pull_m / rally_m) >= bearish_ratio:
-            bearish_pairs += 1
-
-    if len(ratios) < min_pairs:
-        return False, "Not enough volume swing pairs to validate", {"pairs": len(ratios)}
-
-    if bearish_pairs >= 2:
-        return False, "Bearish volume: low volume out / high volume in", {"pairs": len(ratios), "bearish_pairs": bearish_pairs}
-
-    if ok_pairs >= max(1, int(np.ceil(len(ratios) * 0.6))):
-        return True, "Volume character ok", {"pairs": len(ratios), "ok_pairs": ok_pairs, "ratios": ratios}
-
-    return False, "Volume character weak (rallies not stronger than pullbacks)", {"pairs": len(ratios), "ok_pairs": ok_pairs, "ratios": ratios}
-
 
 def tightening_ok(df: pd.DataFrame, cfg: dict) -> tuple[bool, str, dict]:
     """
     Right-side tightening checks (either can pass; both is best):
-      A) ATR% compression: ATRp_right <= ATRp_left * 0.8 (prefer 0.7)
+      A) ATR% compression: ATRp_right <= ATRp_left * X
       B) Final segment tightness:
-           - range_right <= 8% (soft 10%)
-           - closes in top half >= 60% (soft 55%)
+           - range_right <= % threshold
+           - closes in top half >= % threshold
     """
     tcfg = cfg.get("vcp", {}).get("tightening", {}) or {}
 
@@ -537,11 +416,6 @@ def tightening_ok(df: pd.DataFrame, cfg: dict) -> tuple[bool, str, dict]:
     if not atr_ok and not range_ok:
         return False, "No right-side tightening (ATR% and final range both weak)", stats
 
-    if (r_range > right_range_max_soft) and not atr_ok:
-        return False, "Final range too wide and ATR% not compressing", stats
-    if (ratio > left_right_ratio_req) and not (r_range <= right_range_max and top_half_pct >= top_half_min):
-        return False, "ATR% not compressing and final segment not tight enough", stats
-
     if ratio <= left_right_ratio_pref and r_range <= right_range_max and top_half_pct >= top_half_min:
         return True, "Strong right-side tightening (ATR% + tight final segment)", stats
     if ratio <= left_right_ratio_req:
@@ -550,9 +424,6 @@ def tightening_ok(df: pd.DataFrame, cfg: dict) -> tuple[bool, str, dict]:
 
 
 def is_grind_up_not_base(contractions: list[dict], cfg: dict) -> bool:
-    """
-    Reject if there are no meaningful pullbacks (it's just trending).
-    """
     fcfg = cfg.get("vcp", {}).get("fail_filters", {}) or {}
     min_meaningful = float(fcfg.get("min_meaningful_contraction_pct", 7.0))
 
@@ -565,7 +436,7 @@ def is_grind_up_not_base(contractions: list[dict], cfg: dict) -> bool:
 def right_side_vol_expansion_fail(df: pd.DataFrame, depths: list[float], cfg: dict) -> bool:
     """
     Reject if volatility expands on the right:
-      - last contraction > prev contraction by > 20% AND ATR% rising
+      - last contraction > prev contraction by > mult AND ATR% rising
       - multiple wide-range down bars in last segment
     """
     fcfg = cfg.get("vcp", {}).get("fail_filters", {}) or {}
@@ -603,14 +474,6 @@ def right_side_vol_expansion_fail(df: pd.DataFrame, depths: list[float], cfg: di
 
 
 def contraction_shrink_ok(depths: list[float], cfg: dict) -> tuple[bool, str, dict]:
-    """
-    Core VCP shrinking rule (tuned):
-      - 2 <= N <= 6
-      - Mostly shrinking: count(D[i+1] <= D[i]*shrink_step_mult) >= ceil((N-1)*shrink_steps_min_frac)
-      - Allow one exception where D[i+1] can be <= D[i]*exception_step_mult
-      - Overall trend: D_last <= D_first*last_vs_first_max_mult
-      - D_last <= max_last_contraction_pct
-    """
     vcfg = cfg.get("vcp", {}) or {}
     min_c = int(vcfg.get("min_contractions", 2))
     max_c = int(vcfg.get("max_contractions", 6))
@@ -662,32 +525,15 @@ def contraction_shrink_ok(depths: list[float], cfg: dict) -> tuple[bool, str, di
     return True, "Contractions shrinking", {"ok_steps": ok_steps, "exceptions": exceptions, "steps": steps, "depths": depths}
 
 
-def within_52w_high_context(df_full: pd.DataFrame, cfg: dict) -> tuple[bool, str, dict]:
-    """
-    Require the current price to be within X% of the 52-week high.
-    This removes mid-range chop bases that look like VCP to a pivot engine.
-    """
-    ccfg = cfg.get("vcp", {}).get("context", {}) or {}
-    max_dist = float(ccfg.get("max_dist_from_52w_high_pct", 25.0))
-
-    if df_full is None or df_full.empty or len(df_full) < 120:
-        return True, "Not enough data for 52w context check (ignored)", {}
-
-    lookback = int(ccfg.get("high_lookback_bars", 252))
-    seg = df_full.iloc[-min(len(df_full), lookback):]
-    hi = float(seg["high"].max())
-    close = float(df_full["close"].iloc[-1])
-
-    if hi <= 0 or np.isnan(hi) or np.isnan(close):
-        return True, "52w context not available (ignored)", {}
-
-    dist = 100.0 * (hi / close - 1.0)
-    stats = {"hi_lookback": lookback, "hi": hi, "close": close, "dist_pct": dist}
-
-    if dist > max_dist:
-        return False, f"Too far from {lookback}d high ({dist:.1f}% > {max_dist:.1f}%)", stats
-
-    return True, "Near highs context ok", stats
+def dist_from_52w_high_pct(df: pd.DataFrame, lookback: int = 252) -> float:
+    if df is None or df.empty:
+        return 999.0
+    sub = df.iloc[-min(len(df), lookback):]
+    hh = float(sub["high"].max())
+    last = float(df["close"].iloc[-1])
+    if hh <= 0:
+        return 999.0
+    return 100.0 * (hh - last) / hh
 
 
 # ---------------------------
@@ -696,23 +542,13 @@ def within_52w_high_context(df_full: pd.DataFrame, cfg: dict) -> tuple[bool, str
 
 def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
     """
-    Returns:
-      signal: BUY_NOW / WATCH / PASS
-      entry, stop, score, reason
-      details: base_weeks, contractions, depths, pivot, etc.
-
-    Formation is assessed ending yesterday; breakout is assessed on today's bar.
+    Formation assessed ending yesterday; breakout assessed on today's bar.
+    Volume gating is REMOVED (no volume character, no breakout volume confirm).
     """
     out = {"signal": "PASS", "setup": SETUP_NAME, "score": 0, "entry": "", "stop": "", "reason": ""}
 
     if df_full is None or df_full.empty or len(df_full) < 120:
         out["reason"] = "Not enough daily data"
-        return out
-
-    # Context check (near highs)
-    ok_ctx, ctx_reason, _ = within_52w_high_context(df_full, cfg)
-    if not ok_ctx:
-        out["reason"] = ctx_reason
         return out
 
     vcfg = cfg.get("vcp", {}) or {}
@@ -735,23 +571,33 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
     min_pretrend_return = float(vcfg.get("min_pretrend_return_pct", 15.0))
     require_positive_slope = bool(vcfg.get("require_positive_pretrend_slope", True))
 
+    # Pivot selection
     pivot_use_last_rebound = bool(vcfg.get("pivot_use_last_rebound_peak", True))
     pivot_exclude_last_n = int(vcfg.get("pivot_exclude_last_n_bars", 2))
+
+    # Breakout behaviour
+    bcfg = vcfg.get("breakout", {}) or {}
+    breakout_on = str(bcfg.get("price_trigger", "close")).lower()  # close or high
+    require_fresh_cross = bool(bcfg.get("require_fresh_cross", False))  # changed default: false
+
+    # Context (52w high proximity)
+    ctx = vcfg.get("context", {}) or {}
+    max_dist_52w = float(ctx.get("max_dist_from_52w_high_pct", 40.0))
+    if max_dist_52w > 0:
+        d52 = dist_from_52w_high_pct(df_full, lookback=int(ctx.get("lookback_52w_bars", 252)))
+        if d52 > max_dist_52w:
+            out["reason"] = f"Too far from 52w high ({d52:.0f}% > {max_dist_52w:.0f}%)"
+            return out
 
     piv_cfg = vcfg.get("pivots", {}) or {}
     left_opts = piv_cfg.get("left_bars_options", [3, 4, 5, 6, 7])
     right_opts = piv_cfg.get("right_bars_options", [3, 4, 5, 6, 7])
-
-    pivot_cfg = vcfg.get("pivot", {}) or {}
-    pivot_max_lookback = int(pivot_cfg.get("max_lookback_bars", 60))
 
     today = df_full.iloc[-1]
     form = df_full.iloc[:-1].copy()
     if len(form) < 100:
         out["reason"] = "Not enough formation data"
         return out
-
-    yday = form.iloc[-1]
 
     best = None  # (priority, score, result_dict)
 
@@ -771,7 +617,6 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
 
         base = form.iloc[-bars:].copy()
 
-        # left-side high must be early-ish in the window
         left_pos = int(np.nanargmax(base["high"].values))
         if left_pos > int(len(base) * left_high_max_pos):
             continue
@@ -784,7 +629,7 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
         if later_max > left_high * (1 + overshoot_tol / 100.0):
             continue
 
-        # Uptrend into base (no MA): require positive slope + decent return
+        # Uptrend into base
         full_left_pos = (len(df_full) - 1 - bars) + left_pos
         start_pre = max(0, full_left_pos - pretrend_bars)
         if full_left_pos - start_pre < max(30, int(pretrend_bars * 0.6)):
@@ -827,7 +672,6 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
                 if len(depths) < 2:
                     continue
 
-                # Overall base depth cap
                 max_base_depth = float(vcfg.get("max_base_depth_pct", 50.0))
                 base_low = float(sub["low"].min())
                 base_depth = pct_depth(left_high, base_low)
@@ -840,10 +684,6 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
 
                 ok_tight, _, tight_stats = tightening_ok(sub, cfg)
                 if not ok_tight:
-                    continue
-
-                ok_vol, _, _ = volume_character_ok(sub, contractions, cfg)
-                if not ok_vol:
                     continue
 
                 if right_side_vol_expansion_fail(sub, depths, cfg):
@@ -870,25 +710,18 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
                 if pivot_use_last_rebound and contractions[-1].get("rebound_idx") is not None and not np.isnan(contractions[-1].get("rebound_idx", np.nan)):
                     pivot = float(contractions[-1].get("rebound", np.nan))
 
-                # Fallback pivot: constrain to right-side lookback (prevents old highs creating late signals)
                 if np.isnan(pivot) or pivot <= 0:
                     excl = max(0, pivot_exclude_last_n)
-                    usable_len = max(1, len(sub) - excl)
-                    look = max(10, min(pivot_max_lookback, usable_len))
-                    hh_slice = sub["high"].iloc[usable_len - look:usable_len]
+                    hh_slice = sub["high"].iloc[:max(1, len(sub) - excl)] if excl > 0 else sub["high"]
                     pivot = float(hh_slice.max()) if not hh_slice.empty else left_high
 
                 entry = pivot * (1 + entry_buffer_pct / 100.0)
-
-                # Stop = last contraction trough
                 stop = float(contractions[-1]["trough"])
 
-                # Risk (kept for reporting, not gating)
-                risk_pct = pct_depth(entry, stop)
+                # NOTE: risk cap intentionally removed per your request
 
-                # Score (formation quality)
+                # Score
                 score = 50
-
                 if prefer_min_w <= W <= prefer_max_w:
                     score += 10
                 else:
@@ -926,8 +759,6 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
                 elif right_range <= float(cfg.get("vcp", {}).get("tightening", {}).get("right_range_max_pct_soft", 10.0)):
                     score += 4
 
-                score += 6  # passed volume character
-
                 pre_low = float(pre["low"].min()) if "low" in pre.columns else float(pre["close"].min())
                 runup = pct_change(pre_low, left_high)
                 score += int(min(10, max(0, runup / 10.0)))
@@ -944,7 +775,6 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
                     "pivot": pivot,
                     "entry": entry,
                     "stop": stop,
-                    "risk_pct": risk_pct,
                     "runup_pct": runup,
                     "handle_ok": handle_ok,
                     "score": score,
@@ -963,59 +793,21 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
         pivot = float(d["pivot"])
         score = int(d["score"])
 
-        # Breakout confirmation (today)
-        bcfg = vcfg.get("breakout", {}) or {}
-
-        breakout_on = str(bcfg.get("price_trigger", "close")).lower()  # close or high
-        vol_mult = float(bcfg.get("breakout_vol_mult", 1.2))
-        vol_ma = int(bcfg.get("breakout_vol_ma", 50))
-        vol_min = float(bcfg.get("breakout_vol_min", 0.0))
-
-        require_fresh_cross = bool(bcfg.get("require_fresh_cross", True))
-        max_close_ext = float(bcfg.get("max_close_extension_pct", 2.5))
-        max_high_ext = float(bcfg.get("max_high_extension_pct", 4.0))
-        vol_weak_action = str(bcfg.get("volume_action_if_weak", "watch")).lower()  # watch or pass
-
-        max_gap_up = float(bcfg.get("max_gap_up_pct", 8.0))
-        max_breakout_day_range = float(bcfg.get("max_breakout_day_range_pct", 12.0))
-        gap_action = str(bcfg.get("gap_action", "watch")).lower()  # watch or pass
-
         today_close = float(today["close"])
         today_high = float(today["high"])
-        today_low = float(today["low"])
-        today_open = float(today.get("open", today_close))
 
-        y_close = float(yday["close"])
+        prev = form.iloc[-1]
+        prev_close = float(prev["close"])
+        prev_high = float(prev["high"])
 
-        # Price trigger
-        trigger_val = today_close if breakout_on == "close" else today_high
-        y_trigger_val = y_close if breakout_on == "close" else float(yday["high"])
+        price_cross = (today_close > entry) if breakout_on == "close" else (today_high > entry)
 
-        # "Cross today" vs "already above"
-        crossed = (trigger_val > entry)
-        fresh_cross = crossed and (y_trigger_val <= entry)
+        if require_fresh_cross:
+            prev_cross = (prev_close > entry) if breakout_on == "close" else (prev_high > entry)
+            if prev_cross:
+                price_cross = False
 
-        # Near pivot watch condition
         near = today_close >= entry * (1 - near_breakout_pct / 100.0)
-
-        # Gap / event day filter (applies on breakout days; can downgrade or reject)
-        gap_pct = 100.0 * (today_open / y_close - 1.0) if y_close > 0 else 0.0
-        day_range_pct = 100.0 * ((today_high - today_low) / y_close) if y_close > 0 else 0.0
-        gap_flag = (gap_pct > max_gap_up) or (day_range_pct > max_breakout_day_range)
-
-        # Extension checks
-        close_ext_pct = 100.0 * (today_close / entry - 1.0) if entry > 0 else 999.0
-        high_ext_pct = 100.0 * (today_high / entry - 1.0) if entry > 0 else 999.0
-        extended = (close_ext_pct > max_close_ext) or (high_ext_pct > max_high_ext)
-
-        # Breakout volume check (if volume exists)
-        today_vol = float(today.get("volume", np.nan))
-        vol_ok_break = True
-        if "volume" in df_full.columns and not np.isnan(today_vol) and today_vol >= vol_min:
-            vhist = df_full["volume"].iloc[-(vol_ma + 1):-1].dropna()
-            if len(vhist) >= max(20, int(vol_ma * 0.6)):
-                vavg = float(vhist.tail(vol_ma).mean())
-                vol_ok_break = (today_vol > (vavg * vol_mult))
 
         reason_parts = [
             f"{d['contractions']}T",
@@ -1024,59 +816,18 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
             f"pivot {pivot:.2f}",
         ]
 
-        # Decide signal priority
-        signal = "PASS"
-        priority = 0
-
-        # Breakout path
-        if crossed:
-            # Fresh-cross requirement
-            if require_fresh_cross and not fresh_cross:
-                signal = "WATCH"
-                priority = 1
-                reason_parts.append("above pivot but not a fresh cross")
-            else:
-                # Gap / event day downgrade/reject
-                if gap_flag:
-                    if gap_action == "pass":
-                        signal = "PASS"
-                        priority = 0
-                        reason_parts.append(f"gap/event day (gap {gap_pct:.1f}%, range {day_range_pct:.1f}%)")
-                    else:
-                        signal = "WATCH"
-                        priority = 1
-                        reason_parts.append(f"gap/event day (gap {gap_pct:.1f}%, range {day_range_pct:.1f}%)")
-                else:
-                    # Extension downgrade
-                    if extended:
-                        signal = "WATCH"
-                        priority = 1
-                        reason_parts.append(f"extended ({close_ext_pct:.1f}% close, {high_ext_pct:.1f}% high)")
-                    else:
-                        # Volume: if weak, action is configurable (default WATCH)
-                        if vol_ok_break:
-                            signal = "BUY_NOW"
-                            priority = 2
-                            reason_parts.append("fresh breakout")
-                        else:
-                            if vol_weak_action == "pass":
-                                signal = "PASS"
-                                priority = 0
-                                reason_parts.append("breakout but volume weak")
-                            else:
-                                signal = "WATCH"
-                                priority = 1
-                                reason_parts.append("breakout but volume weak")
-
-        # No breakout: watch if near pivot, else pass
+        if price_cross:
+            signal = "BUY_NOW"
+            reason_parts.append("breakout")
+            priority = 2
         elif near:
             signal = "WATCH"
-            priority = 1
             reason_parts.append("near pivot")
+            priority = 1
         else:
             signal = "PASS"
-            priority = 0
             reason_parts.append("valid VCP but not near pivot")
+            priority = 0
 
         result = {
             "signal": signal,
@@ -1089,7 +840,7 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
             "base_weeks": d["W"],
             "contractions": d["contractions"],
             "depths": "->".join([f"{x:.1f}" for x in d["depths"]]),
-            "risk_pct": f"{d['risk_pct']:.1f}",
+            "risk_pct": f"{pct_depth(entry, stop):.1f}",
             "runup_pct": f"{d['runup_pct']:.0f}",
         }
 
@@ -1209,6 +960,10 @@ def main():
         batch_size = 55
     batch_size = min(batch_size, max_credits_per_min)
 
+    # Exchange filtering: NO whitelist, only exclude list (to avoid nuking unknown formats)
+    fcfg = cfg.get("filters", {}) or {}
+    exclude_exchanges = [str(x).upper() for x in (fcfg.get("exclude_exchanges", []) or [])]
+
     results: list[dict] = []
     errors = 0
     api_calls = 0
@@ -1229,25 +984,30 @@ def main():
             # Single-symbol response shape
             if isinstance(data, dict) and "values" in data:
                 sym = sym_batch[0]
-                df = normalise_timeseries_payload(sym, data)
+                payload = data
+                df = normalise_timeseries_payload(sym, payload)
+
+                # Exchange exclude
+                if get_exchange(sym) in exclude_exchanges:
+                    results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "reason": "Excluded exchange"})
+                    continue
+
                 if df.empty:
-                    results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "reason": data.get("message", "No data")})
+                    results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "reason": payload.get("message", "No data")})
                 else:
-                    ok_ex, ex_reason = exchange_allowed(sym, cfg)
-                    if not ok_ex:
-                        results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "reason": ex_reason})
-                    else:
-                        ok_liq, liq_reason, _ = liquidity_ok(df, cfg)
-                        if not ok_liq:
-                            results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "reason": liq_reason})
-                        else:
-                            r = detect_vcp(df, cfg)
-                            results.append({"ticker": sym, **r})
+                    r = detect_vcp(df, cfg)
+                    results.append({"ticker": sym, **r})
             else:
                 # Multi-symbol response
                 for sym in sym_batch:
                     payload = data.get(sym, {}) if isinstance(data, dict) else {}
                     df = normalise_timeseries_payload(sym, payload)
+
+                    # Exchange exclude
+                    if get_exchange(sym) in exclude_exchanges:
+                        results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "reason": "Excluded exchange"})
+                        continue
+
                     if df.empty:
                         results.append({
                             "ticker": sym,
@@ -1258,16 +1018,6 @@ def main():
                             "stop": "",
                             "reason": payload.get("message", "No data"),
                         })
-                        continue
-
-                    ok_ex, ex_reason = exchange_allowed(sym, cfg)
-                    if not ok_ex:
-                        results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "reason": ex_reason})
-                        continue
-
-                    ok_liq, liq_reason, _ = liquidity_ok(df, cfg)
-                    if not ok_liq:
-                        results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "reason": liq_reason})
                         continue
 
                     r = detect_vcp(df, cfg)
@@ -1351,7 +1101,7 @@ def main():
     watch_count = len(watch_items)
     pass_count = max(0, len(results) - buy_count - watch_count)
 
-    note = f"ok ({tickers_source}) paced at {max_credits_per_min}/min, batch_size={batch_size}"
+    note = f"ok ({tickers_source}) paced at {max_credits_per_min}/min, batch_size={batch_size} (no volume gating)"
 
     summary_rows = [
         ["key", "value"],
