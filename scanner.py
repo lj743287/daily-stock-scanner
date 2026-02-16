@@ -415,10 +415,10 @@ def volume_character_ok(df: pd.DataFrame, contractions: list[dict], cfg: dict) -
 def tightening_ok(df: pd.DataFrame, cfg: dict) -> tuple[bool, str, dict]:
     """
     Right-side tightening checks (either can pass; both is best):
-      A) ATR% compression: ATRp_right <= ATRp_left * 0.8 (prefer 0.7)
+      A) ATR% compression: ATRp_right <= ATRp_left * X
       B) Final segment tightness:
-           - range_right <= 8% (soft 10%)
-           - closes in top half >= 60% (soft 55%)
+           - range_right <= Y
+           - closes in top half >= Z
     """
     tcfg = cfg.get("vcp", {}).get("tightening", {}) or {}
 
@@ -500,7 +500,7 @@ def is_grind_up_not_base(contractions: list[dict], cfg: dict) -> bool:
 def right_side_vol_expansion_fail(df: pd.DataFrame, depths: list[float], cfg: dict) -> bool:
     """
     Reject if volatility expands on the right:
-      - last contraction > prev contraction by > 20% AND ATR% rising
+      - last contraction > prev contraction by > X AND ATR% rising
       - multiple wide-range down bars in last segment
     """
     fcfg = cfg.get("vcp", {}).get("fail_filters", {}) or {}
@@ -539,14 +539,12 @@ def right_side_vol_expansion_fail(df: pd.DataFrame, depths: list[float], cfg: di
 
 def contraction_shrink_ok(depths: list[float], cfg: dict) -> tuple[bool, str, dict]:
     """
-    Core VCP shrinking rule (your spec):
+    Core VCP shrinking rule (loosened via config):
       - 2 <= N <= 6
-      - Mostly shrinking: count(D[i+1] <= D[i]*0.85) >= ceil((N-1)*0.6)
-      - Allow one exception where D[i+1] can be <= D[i]*1.2
-      - Overall trend: D_last <= D_first*0.6
-      - D_last <= 12% (configurable)
-
-    depths are % values: e.g. [27.0, 17.0, 8.0]
+      - Mostly shrinking: count(D[i+1] <= D[i]*shrink_step_mult) >= ceil((N-1)*shrink_steps_min_frac)
+      - Allow one exception where D[i+1] can be <= D[i]*exception_step_mult
+      - Overall trend: D_last <= D_first*last_vs_first_max_mult
+      - D_last <= max_last_contraction_pct
     """
     vcfg = cfg.get("vcp", {}) or {}
     min_c = int(vcfg.get("min_contractions", 2))
@@ -633,8 +631,8 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
     entry_buffer_pct = float(vcfg.get("entry_buffer_pct", 0.2))
     near_breakout_pct = float(vcfg.get("near_breakout_pct", 3.0))
 
-    # Stop / risk constraints
-    max_stop_pct_trade = float(vcfg.get("max_stop_pct_trade", 10.0))
+    # Risk cap (REMOVED if not set or <= 0)
+    max_stop_pct_trade = float(vcfg.get("max_stop_pct_trade", 0.0) or 0.0)
 
     # Pretrend context (no MA filters)
     pretrend_bars = int(vcfg.get("pretrend_bars", 100))
@@ -781,10 +779,13 @@ def detect_vcp(df_full: pd.DataFrame, cfg: dict) -> dict:
                 # Stop = last contraction trough
                 stop = float(contractions[-1]["trough"])
 
-                # Risk cap
-                risk_pct = pct_depth(entry, stop)
-                if risk_pct > max_stop_pct_trade:
-                    continue
+                # Risk cap (disabled if max_stop_pct_trade <= 0)
+                if max_stop_pct_trade > 0:
+                    risk_pct = pct_depth(entry, stop)
+                    if risk_pct > max_stop_pct_trade:
+                        continue
+                else:
+                    risk_pct = pct_depth(entry, stop)
 
                 # Score (formation quality)
                 score = 50
@@ -994,7 +995,7 @@ def rate_limit_wait(batch_credits: int, max_credits_per_min: int, state: dict) -
         state["used"] = used + batch_credits
         return
 
-    sleep_s = max(0.0, 60.0 - elapsed) + 1.2
+    sleep_s = max(0.0, 60.0 - elapsed) + 0.2
     time.sleep(sleep_s)
 
     state["window_start"] = time.monotonic()
