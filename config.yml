@@ -10,14 +10,17 @@ api:
 
 pattern:
   # Big move higher (ends by yesterday at the latest)
+  # Run-up definition
   big_move:
     lookback_bars: 63
     min_move_pct: 30.0
+    min_move_pct: 25.0
     max_move_pct: 1200.0
     min_move_bars: 2
     max_move_bars: 25
 
   # Surf definition (your spec)
+  # Pullback + surf definition
   surf:
     ema10: 10
     ema20: 20
@@ -25,19 +28,25 @@ pattern:
 
     min_surf_bars: 2
     max_surf_bars: 42
+    max_surf_bars: 50
 
     # Touches must be at least 1 in 2 bars
+    # Price should touch one of the EMAs at least 1 in 2 bars
     min_touch_frac: 0.50
 
     # Higher-low swing definition (realtime)
+    # Realtime swing definition used for higher-low tracking
     hl_left_bars: 3
 
     # Tightening: open-to-close bodies trend smaller (negative slope)
     # slope must be < this (keep it slightly negative to avoid noise)
+    # Tightening bodies: slope(abs(close-open)) must be < this threshold
     body_slope_max: -0.000000001
 
   # BUY trigger (your spec)
+  # BUY trigger (breakout with volume)
   buy:
+    breakout_lookback: 5
     vol_ma: 50
     vol_mult_vs_ma: 1.40
     require_green_candle: true
