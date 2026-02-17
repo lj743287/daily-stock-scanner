@@ -10,7 +10,7 @@ import numpy as np
 import gspread
 
 TD_BASE = "https://api.twelvedata.com/time_series"
-SETUP_NAME = "Momentum Pullback Breakout"
+SETUP_NAME = "Momentum EMA Surf HL (Buy on HL vol)"
 
 
 # ---------------------------
@@ -186,14 +186,6 @@ def ema(s: pd.Series, length: int) -> pd.Series:
     return s.ewm(span=length, adjust=False).mean()
 
 
-def true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr1 = (df["high"] - df["low"]).abs()
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-
 def linreg_slope(y: np.ndarray) -> float:
     if y.size < 5:
         return 0.0
@@ -211,49 +203,6 @@ def pct_change(a: float, b: float) -> float:
     return 100.0 * (b / a - 1.0)
 
 
-def pct_range(high_val: float, low_val: float, denom: float | None = None) -> float:
-    if denom is None:
-        denom = high_val
-    if denom <= 0 or np.isnan(denom):
-        return np.nan
-    return 100.0 * (high_val - low_val) / denom
-
-
-# ---------------------------
-# Pivot lows (for "higher low")
-# ---------------------------
-
-def find_pivot_lows(low: pd.Series, left: int, right: int) -> list[tuple[int, float]]:
-    """
-    Pivot Low: low[i] is min in [i-left, i+right]
-    Returns list of (index, price) sorted by index.
-    """
-    n = len(low)
-    out: list[tuple[int, float]] = []
-    if n < left + right + 3:
-        return out
-
-    lv = low.values
-    for i in range(left, n - right):
-        w0 = i - left
-        w1 = i + right + 1
-        li = lv[i]
-        if np.isnan(li):
-            continue
-        win = lv[w0:w1]
-        if np.isnan(win).all():
-            continue
-        if li <= np.nanmin(win):
-            out.append((i, float(li)))
-
-    out.sort(key=lambda x: x[0])
-    return out
-
-
-# ---------------------------
-# Pattern logic
-# ---------------------------
-
 def compute_returns(df: pd.DataFrame, bars: int) -> float:
     if df is None or df.empty or len(df) <= bars:
         return np.nan
@@ -262,31 +211,45 @@ def compute_returns(df: pd.DataFrame, bars: int) -> float:
     return pct_change(a, b)
 
 
-def detect_big_move(df: pd.DataFrame, cfg: dict) -> dict:
+def touch_ema(low: float, high: float, ema_val: float) -> bool:
+    if np.isnan(low) or np.isnan(high) or np.isnan(ema_val):
+        return False
+    return (low <= ema_val <= high)
+
+
+# ---------------------------
+# Big move detector
+# ---------------------------
+
+def detect_big_move(df_form: pd.DataFrame, cfg: dict) -> dict:
     """
-    Detect a strong up-move within the last 1-3 months (default last 63 bars),
-    where the move itself lasts a few days to a few weeks.
+    Big move higher in the past 1–3 months:
+      - Lookback max 63 bars (configurable)
+      - Move lasts min 2 bars (user confirmed), max configurable
+      - Min move % configurable (default 30%)
+
+    IMPORTANT: We scan formation data ending yesterday, so the big move must
+    have completed by yesterday at the latest.
     """
     pcfg = cfg.get("pattern", {}) or {}
     mc = pcfg.get("big_move", {}) or {}
 
     lookback = int(mc.get("lookback_bars", 63))
     min_move_pct = float(mc.get("min_move_pct", 30.0))
-    max_move_pct = float(mc.get("max_move_pct", 1200.0))  # effectively no ceiling
-    min_len = int(mc.get("min_move_bars", 3))
+    max_move_pct = float(mc.get("max_move_pct", 1200.0))
+    min_len = int(mc.get("min_move_bars", 2))
     max_len = int(mc.get("max_move_bars", 25))
 
-    if len(df) < lookback + max_len + 5:
+    if len(df_form) < lookback + max_len + 10:
         return {"ok": False, "reason": "Not enough data for big-move scan"}
 
-    c = df["close"].values
+    c = df_form["close"].values
     n = len(c)
-    start_i = max(0, n - lookback - max_len - 1)
+
     end_i = n - 1
+    start_i = max(0, n - lookback - max_len - 1)
 
     best = None  # (ret, i, j)
-
-    # Brute force within bounded ranges (cheap at these sizes)
     for i in range(start_i, end_i - min_len):
         ci = c[i]
         if np.isnan(ci) or ci <= 0:
@@ -317,246 +280,269 @@ def detect_big_move(df: pd.DataFrame, cfg: dict) -> dict:
     }
 
 
-def consolidation_ok(df: pd.DataFrame, move_end_idx: int, cfg: dict) -> dict:
+# ---------------------------
+# Realtime swing-low / higher-low
+# ---------------------------
+
+def swing_low_realtime(low: pd.Series, idx: int, left: int) -> bool:
     """
-    First orderly pullback + consolidation:
-      - consolidation length between 8 days and 2 months (default 8-42 bars)
-      - higher lows (pivot lows rising)
-      - tightening range (range compression)
-      - "surfs" rising 10/20 EMA (optionally 50 EMA)
+    Realtime-friendly swing low:
+      low[idx] is the lowest of the last (left+1) bars ending at idx.
+    No right bars (no future knowledge).
+    """
+    if idx < left:
+        return False
+    window = low.iloc[idx - left: idx + 1]
+    if window.isna().any():
+        return False
+    return float(low.iloc[idx]) <= float(window.min())
+
+
+def find_higher_low_events(low: pd.Series, start_idx: int, end_idx: int, left: int) -> list[dict]:
+    """
+    Scan [start_idx..end_idx] for realtime swing lows and identify higher lows.
+    Returns list of events: {idx, low, prev_low, is_higher_low}
+    """
+    events = []
+    prev_swing_low = None
+
+    for i in range(start_idx, end_idx + 1):
+        if not swing_low_realtime(low, i, left):
+            continue
+        cur = float(low.iloc[i])
+        is_hl = (prev_swing_low is not None and cur > prev_swing_low)
+        events.append({"idx": i, "low": cur, "prev_low": prev_swing_low, "is_hl": bool(is_hl)})
+        prev_swing_low = cur
+
+    return events
+
+
+# ---------------------------
+# Surf detector (your exact spec)
+# ---------------------------
+
+def detect_surf_window(df_full: pd.DataFrame, move_end_form_idx: int, cfg: dict) -> dict:
+    """
+    Your definition:
+
+    - After the big move ends (index in df_form), the first EMA touch marks surf start
+    - Touch = low <= EMA <= high (no % threshold)
+    - From the touch bar onwards it must stop making lower lows:
+        min(low[touch..end]) >= low[touch]
+    - Surf length between 2 and 42 bars
+    - Must touch an EMA at least 1 in 2 bars in the surf window (>=50% touch rate)
+    - Open-to-close bodies tighten (trend down): slope(abs(close-open)) < 0
+    - Higher lows start to appear (at least one HL event in the surf window)
+
+    We prefer the latest valid surf end (closest to today).
     """
     pcfg = cfg.get("pattern", {}) or {}
+    scfg = pcfg.get("surf", {}) or {}
 
-    ccfg = pcfg.get("consolidation", {}) or {}
-    min_bars = int(ccfg.get("min_bars", 8))
-    max_bars = int(ccfg.get("max_bars", 42))
-    pivot_left = int(ccfg.get("pivot_left", 3))
-    pivot_right = int(ccfg.get("pivot_right", 3))
+    ema10_len = int(scfg.get("ema10", 10))
+    ema20_len = int(scfg.get("ema20", 20))
+    ema50_len = int(scfg.get("ema50", 50))
 
-    tighten_mult = float(ccfg.get("tighten_right_to_left_mult", 0.75))
-    max_range_pct = float(ccfg.get("max_range_pct", 18.0))
+    min_bars = int(scfg.get("min_surf_bars", 2))
+    max_bars = int(scfg.get("max_surf_bars", 42))
 
-    # EMA surf
-    ecfg = pcfg.get("ema_surf", {}) or {}
-    ema10 = int(ecfg.get("ema10", 10))
-    ema20 = int(ecfg.get("ema20", 20))
-    ema50 = int(ecfg.get("ema50", 50))
-    use_50 = bool(ecfg.get("allow_50", True))
-    surf_dist_pct = float(ecfg.get("max_close_dist_pct", 2.5))
-    min_surf_frac = float(ecfg.get("min_surf_frac", 0.45))
-    require_rising = bool(ecfg.get("require_rising_emas", True))
+    min_touch_frac = float(scfg.get("min_touch_frac", 0.50))
 
-    # We evaluate consolidation ending yesterday (formation), breakout today
-    form = df.iloc[:-1].copy()
-    if len(form) < max_bars + 60:
-        return {"ok": False, "reason": "Not enough formation data"}
+    # Higher low swing definition (realtime)
+    hl_left = int(scfg.get("hl_left_bars", 3))
 
-    # Consolidation must occur AFTER the big move ended
-    # Choose the best consolidation window in the last max_bars after move_end_idx
-    end_form_idx = len(form) - 1
+    # Tightening definition
+    min_body_slope = float(scfg.get("body_slope_max", -1e-9))  # slope must be < this (negative)
 
-    # Candidate windows end at end_form_idx and start within [end-max_bars+1, end-min_bars+1]
-    best = None  # (score, start, end, details)
+    if df_full is None or df_full.empty or len(df_full) < max(200, ema50_len + 50):
+        return {"ok": False, "reason": "Not enough data for surf detection"}
 
-    close = form["close"]
-    high = form["high"]
-    low = form["low"]
+    # df_form ends yesterday; df_full includes today
+    df_form = df_full.iloc[:-1].copy()
+    if len(df_form) < move_end_form_idx + 3:
+        return {"ok": False, "reason": "Formation too short after big move"}
 
-    e10 = ema(close, ema10)
-    e20 = ema(close, ema20)
-    e50 = ema(close, ema50)
+    close = df_full["close"]
+    low = df_full["low"]
+    high = df_full["high"]
+    opn = df_full["open"]
 
-    for bars in range(min_bars, max_bars + 1):
-        s = end_form_idx - bars + 1
-        e = end_form_idx
-        if s <= move_end_idx:
-            continue  # must be after move end
-        seg = form.iloc[s:e + 1]
+    e10 = ema(close, ema10_len)
+    e20 = ema(close, ema20_len)
+    e50 = ema(close, ema50_len)
+
+    # Surf start search begins AFTER the move end (in formation indices),
+    # but surf can start today as well.
+    start_search = move_end_form_idx + 1
+    last_idx = len(df_full) - 1  # today index in df_full
+
+    touch_idx = None
+    touch_ema_name = None
+
+    for i in range(start_search, last_idx + 1):
+        lo = float(low.iloc[i])
+        hi = float(high.iloc[i])
+        if touch_ema(lo, hi, float(e10.iloc[i])):
+            touch_idx, touch_ema_name = i, "EMA10"
+            break
+        if touch_ema(lo, hi, float(e20.iloc[i])):
+            touch_idx, touch_ema_name = i, "EMA20"
+            break
+        if touch_ema(lo, hi, float(e50.iloc[i])):
+            touch_idx, touch_ema_name = i, "EMA50"
+            break
+
+    if touch_idx is None:
+        return {"ok": False, "reason": "No first EMA touch found after big move"}
+
+    touch_low = float(low.iloc[touch_idx])
+
+    # Evaluate candidate surf ends (prefer latest) with start fixed at touch_idx
+    best = None  # (end_idx, details)
+    max_end = min(last_idx, touch_idx + max_bars - 1)
+    min_end = min(last_idx, touch_idx + min_bars - 1)
+
+    for end_idx in range(min_end, max_end + 1):
+        seg = df_full.iloc[touch_idx:end_idx + 1]
         if len(seg) < min_bars:
             continue
 
-        hh = float(seg["high"].max())
-        ll = float(seg["low"].min())
-        mid = (hh + ll) / 2.0 if (hh + ll) != 0 else hh
-        r_pct = pct_range(hh, ll, denom=mid)
-        if np.isnan(r_pct) or r_pct > max_range_pct:
+        # Must stop making lower lows from touch onwards
+        if float(seg["low"].min()) < touch_low:
             continue
 
-        # Tightening: compare left half range to right half range
-        half = max(3, int(len(seg) / 2))
-        left_seg = seg.iloc[:half]
-        right_seg = seg.iloc[-half:]
-        lhh, lll = float(left_seg["high"].max()), float(left_seg["low"].min())
-        rhh, rll = float(right_seg["high"].max()), float(right_seg["low"].min())
-        lmid = (lhh + lll) / 2.0 if (lhh + lll) != 0 else lhh
-        rmid = (rhh + rll) / 2.0 if (rhh + rll) != 0 else rhh
-        l_rng = pct_range(lhh, lll, denom=lmid)
-        r_rng = pct_range(rhh, rll, denom=rmid)
-        if np.isnan(l_rng) or np.isnan(r_rng):
-            continue
-        if r_rng > (l_rng * tighten_mult):
+        # Touch rate (touching any EMA counts)
+        touches = 0
+        for k in range(touch_idx, end_idx + 1):
+            lo = float(low.iloc[k])
+            hi = float(high.iloc[k])
+            if touch_ema(lo, hi, float(e10.iloc[k])) or touch_ema(lo, hi, float(e20.iloc[k])) or touch_ema(lo, hi, float(e50.iloc[k])):
+                touches += 1
+        touch_frac = touches / float(len(seg))
+
+        if touch_frac < min_touch_frac:
             continue
 
-        # Higher low: last two pivot lows rising within the consolidation
-        piv_lows = find_pivot_lows(seg["low"], pivot_left, pivot_right)
-        if len(piv_lows) < 2:
+        # Tightening bodies: slope(abs(close-open)) must be negative
+        bodies = (seg["close"] - seg["open"]).abs().values.astype(float)
+        if np.isnan(bodies).any() or bodies.size < 5:
             continue
-        last2 = piv_lows[-2:]
-        if not (last2[1][1] > last2[0][1]):
-            continue
-
-        # EMA surf: fraction of bars where close is "near" at least one rising EMA (10/20, optionally 50)
-        seg_idx = seg.index
-        cseg = close.loc[seg_idx]
-        e10s = e10.loc[seg_idx]
-        e20s = e20.loc[seg_idx]
-        e50s = e50.loc[seg_idx]
-
-        def dist_ok(cval, eval_) -> bool:
-            if np.isnan(cval) or np.isnan(eval_) or eval_ <= 0:
-                return False
-            return abs(100.0 * (cval / eval_ - 1.0)) <= surf_dist_pct
-
-        near10 = [dist_ok(float(cseg.iloc[k]), float(e10s.iloc[k])) for k in range(len(seg))]
-        near20 = [dist_ok(float(cseg.iloc[k]), float(e20s.iloc[k])) for k in range(len(seg))]
-        if use_50:
-            near50 = [dist_ok(float(cseg.iloc[k]), float(e50s.iloc[k])) for k in range(len(seg))]
-            near_any = np.array(near10) | np.array(near20) | np.array(near50)
-        else:
-            near_any = np.array(near10) | np.array(near20)
-
-        surf_frac = float(np.mean(near_any)) if len(seg) else 0.0
-        if surf_frac < min_surf_frac:
+        slope = linreg_slope(bodies)
+        if not (slope < min_body_slope):
             continue
 
-        # EMAs rising (simple slope check on last 10 bars of the consolidation)
-        if require_rising:
-            w = min(10, len(seg))
-            s10 = linreg_slope(e10s.tail(w).values)
-            s20 = linreg_slope(e20s.tail(w).values)
-            if s10 <= 0 or s20 <= 0:
-                continue
-            if use_50:
-                s50 = linreg_slope(e50s.tail(w).values)
-                # 50 can be flat-ish, but not sharply down
-                if s50 < -1e-6:
-                    continue
+        # Higher lows must start to appear in the surf window
+        hl_events = find_higher_low_events(df_full["low"], touch_idx, end_idx, hl_left)
+        has_hl = any(ev["is_hl"] for ev in hl_events)
+        if not has_hl:
+            continue
 
-        # Score: prefer longer, tighter, more surf, and higher-low strength
-        hl_strength = 100.0 * (last2[1][1] / last2[0][1] - 1.0)
-        score = 0
-        score += int(min(25, (bars / max_bars) * 25))
-        score += int(min(25, max(0.0, (l_rng - r_rng) / max(1e-6, l_rng)) * 25))
-        score += int(min(25, surf_frac * 25))
-        score += int(min(25, max(0.0, hl_strength) * 4.0))  # small bonus
-
-        details = {
-            "cons_bars": bars,
-            "cons_start_idx": int(s),
-            "cons_end_idx": int(e),
-            "cons_high": float(hh),
-            "cons_low": float(ll),
-            "cons_range_pct": float(r_pct),
-            "left_range_pct": float(l_rng),
-            "right_range_pct": float(r_rng),
-            "surf_frac": float(surf_frac),
-            "hl0_idx": int(s + last2[0][0]),
-            "hl0_price": float(last2[0][1]),
-            "hl1_idx": int(s + last2[1][0]),
-            "hl1_price": float(last2[1][1]),
+        # Keep latest valid end
+        best = {
+            "touch_idx": int(touch_idx),
+            "touch_ema": touch_ema_name,
+            "touch_low": float(touch_low),
+            "surf_end_idx": int(end_idx),
+            "surf_bars": int(len(seg)),
+            "touches": int(touches),
+            "touch_frac": float(touch_frac),
+            "body_slope": float(slope),
+            "hl_left_bars": int(hl_left),
+            "hl_events": hl_events,
         }
 
-        if best is None or score > best[0]:
-            best = (score, s, e, details)
-
     if best is None:
-        return {"ok": False, "reason": "No valid orderly consolidation found after big move"}
+        return {"ok": False, "reason": "Touch found but no valid surf window meeting all rules"}
 
-    return {"ok": True, **best[3]}
+    return {"ok": True, **best}
 
 
-def breakout_today(df: pd.DataFrame, cons_high: float, cfg: dict) -> dict:
+# ---------------------------
+# BUY trigger: Higher-low day with vol expansion
+# ---------------------------
+
+def buy_trigger_today(df_full: pd.DataFrame, surf: dict, cfg: dict) -> dict:
     """
-    Breakout / range expansion today:
-      - price trigger crosses above consolidation high (+buffer)
-      - volume today > vol_mult * 50dma
-      - range expansion proxy: TR% > median(TR%) * tr_mult (optional)
+    BUY is the higher low with expanded volume > 1.4 x the 50dma.
+
+    Implemented as:
+      - Today is a realtime swing-low (left bars) AND it is a higher low vs previous swing low
+      - Today volume > vol_mult * SMA(vol, 50)
+
+    Entry = today's close
+    Stop  = today's low
     """
     pcfg = cfg.get("pattern", {}) or {}
-    bcfg = pcfg.get("breakout", {}) or {}
+    bcfg = pcfg.get("buy", {}) or {}
 
-    price_trigger = str(bcfg.get("price_trigger", "close")).lower()  # close or high
-    entry_buffer_pct = float(bcfg.get("entry_buffer_pct", 0.2))
-
-    vol_mult = float(bcfg.get("vol_mult_vs_50dma", 1.4))
     vol_ma = int(bcfg.get("vol_ma", 50))
+    vol_mult = float(bcfg.get("vol_mult_vs_ma", 1.40))
+    hl_left = int((cfg.get("pattern", {}) or {}).get("surf", {}).get("hl_left_bars", 3))
 
-    require_tr_expansion = bool(bcfg.get("require_tr_expansion", True))
-    tr_mult = float(bcfg.get("tr_mult_vs_median", 1.3))
-    tr_lookback = int(bcfg.get("tr_median_lookback", 20))
+    last_idx = len(df_full) - 1
+    if last_idx < max(80, vol_ma + 5):
+        return {"buy": False, "reason": "Not enough data for BUY volume MA"}
 
-    today = df.iloc[-1]
-    prev = df.iloc[-2]
+    low = df_full["low"]
+    vol = df_full.get("volume", pd.Series([np.nan] * len(df_full)))
+    opn = df_full["open"]
+    cls = df_full["close"]
 
-    level = cons_high * (1.0 + entry_buffer_pct / 100.0)
+    # Must be within the surf window
+    if not (surf["touch_idx"] <= last_idx <= surf["surf_end_idx"]):
+        # If surf_end is before today (rare), treat as no BUY today
+        return {"buy": False, "reason": "Today not within detected surf window"}
 
-    today_close = float(today["close"])
-    today_high = float(today["high"])
-    today_open = float(today["open"])
-    today_vol = float(today.get("volume", np.nan))
+    # Find swing lows up to today and check if today is a higher-low event
+    events = find_higher_low_events(low, surf["touch_idx"], last_idx, hl_left)
+    today_ev = None
+    for ev in reversed(events):
+        if ev["idx"] == last_idx:
+            today_ev = ev
+            break
 
-    crossed = (today_close > level) if price_trigger == "close" else (today_high > level)
+    if today_ev is None or not today_ev["is_hl"]:
+        return {"buy": False, "reason": "Today is not a higher-low swing day"}
 
-    # Volume
-    vol_ok = True
-    if "volume" in df.columns and not np.isnan(today_vol):
-        hist = df["volume"].iloc[-(vol_ma + 1):-1].dropna()
-        if len(hist) >= max(20, int(vol_ma * 0.6)):
-            vavg = float(hist.tail(vol_ma).mean())
-            vol_ok = (today_vol > (vavg * vol_mult))
-        else:
-            vol_ok = False
+    today_vol = float(vol.iloc[last_idx]) if "volume" in df_full.columns else np.nan
+    if np.isnan(today_vol) or today_vol <= 0:
+        return {"buy": False, "reason": "Volume not available"}
 
-    # TR expansion (range expansion proxy)
-    tr_ok = True
-    if require_tr_expansion:
-        tr = true_range(df)
-        trp = (tr / df["close"]) * 100.0
-        med = trp.iloc[-(tr_lookback + 1):-1].dropna()
-        if len(med) >= max(10, int(tr_lookback * 0.5)):
-            base = float(med.median())
-            today_trp = float(trp.iloc[-1])
-            tr_ok = (today_trp > base * tr_mult)
-        else:
-            tr_ok = False
+    hist = vol.iloc[-(vol_ma + 1):-1].dropna()
+    if len(hist) < max(20, int(vol_ma * 0.6)):
+        return {"buy": False, "reason": "Not enough volume history for MA"}
 
-    # A small sanity: breakout bar should be at least not a big red reversal
-    not_bad_reversal = not (today_close < today_open and today_close < float(prev["close"]))
+    vavg = float(hist.tail(vol_ma).mean())
+    if vavg <= 0:
+        return {"buy": False, "reason": "Invalid volume MA"}
+
+    vol_ok = today_vol > (vavg * vol_mult)
+    if not vol_ok:
+        return {"buy": False, "reason": f"Volume not expanded (> {vol_mult:.2f}x{vol_ma}dma)"}
+
+    # Optional: require a constructive candle (default true)
+    require_green = bool(bcfg.get("require_green_candle", True))
+    if require_green:
+        if float(cls.iloc[last_idx]) <= float(opn.iloc[last_idx]):
+            return {"buy": False, "reason": "Higher low day but not a green candle"}
 
     return {
-        "crossed": bool(crossed),
-        "vol_ok": bool(vol_ok),
-        "tr_ok": bool(tr_ok),
-        "not_bad_reversal": bool(not_bad_reversal),
-        "level": float(level),
-        "today_close": today_close,
+        "buy": True,
+        "entry": float(cls.iloc[last_idx]),
+        "stop": float(low.iloc[last_idx]),
         "today_vol": today_vol,
+        "vol_ma": vavg,
+        "vol_mult": vol_mult,
+        "hl_low": float(today_ev["low"]),
+        "prev_swing_low": float(today_ev["prev_low"]) if today_ev["prev_low"] is not None else np.nan,
     }
 
 
 # ---------------------------
-# Main detector (WATCH / BUY_NOW)
+# Full detector per ticker
 # ---------------------------
 
 def detect_setup(df_full: pd.DataFrame, cfg: dict) -> dict:
-    """
-    Formation is assessed ending yesterday; breakout is assessed on today's bar.
-
-    Outputs:
-      - PASS / WATCH / BUY_NOW
-      - entry, stop
-      - reasons and details for sheet
-    """
     out = {
         "signal": "PASS",
         "setup": SETUP_NAME,
@@ -567,102 +553,78 @@ def detect_setup(df_full: pd.DataFrame, cfg: dict) -> dict:
         "r1m": "",
         "r3m": "",
         "r6m": "",
+        "move_ret": "",
+        "surf_bars": "",
+        "touch_frac": "",
+        "touch_ema": "",
     }
 
-    if df_full is None or df_full.empty or len(df_full) < 200:
+    if df_full is None or df_full.empty or len(df_full) < 220:
         out["reason"] = "Not enough daily data"
         return out
 
-    # Compute timeframe returns (1m=21, 3m=63, 6m=126 trading days)
+    # Returns for reference (no filtering)
     r1m = compute_returns(df_full, 21)
     r3m = compute_returns(df_full, 63)
     r6m = compute_returns(df_full, 126)
-
     out["r1m"] = f"{r1m:.1f}" if not np.isnan(r1m) else ""
     out["r3m"] = f"{r3m:.1f}" if not np.isnan(r3m) else ""
     out["r6m"] = f"{r6m:.1f}" if not np.isnan(r6m) else ""
 
-    # Big move
-    bm = detect_big_move(df_full, cfg)
+    # Formation is df_form ending yesterday
+    df_form = df_full.iloc[:-1].copy()
+    if len(df_form) < 200:
+        out["reason"] = "Not enough formation data"
+        return out
+
+    # 1) Big move (ends by yesterday at the latest)
+    bm = detect_big_move(df_form, cfg)
     if not bm.get("ok"):
         out["reason"] = bm.get("reason", "No big move")
         return out
 
-    # Consolidation after big move
-    cons = consolidation_ok(df_full, int(bm["move_end_idx"]), cfg)
-    if not cons.get("ok"):
-        out["reason"] = cons.get("reason", "No orderly consolidation")
+    out["move_ret"] = f"{bm['move_ret']:.0f}"
+
+    # 2) Surf window (starts at first EMA touch after big move end; includes today if still surfing)
+    surf = detect_surf_window(df_full, int(bm["move_end_idx"]), cfg)
+    if not surf.get("ok"):
+        out["reason"] = surf.get("reason", "No valid surf window")
         return out
 
-    # Breakout today?
-    bo = breakout_today(df_full, float(cons["cons_high"]), cfg)
+    out["surf_bars"] = str(surf["surf_bars"])
+    out["touch_frac"] = f"{surf['touch_frac']:.2f}"
+    out["touch_ema"] = surf.get("touch_ema", "")
 
-    # Stop = most recent higher-low pivot price (hl1_price)
-    stop = float(cons["hl1_price"])
-    entry_level = float(bo["level"])
-    # Risk %
-    risk_pct = 100.0 * (entry_level - stop) / entry_level if entry_level > 0 else np.nan
+    # 3) WATCH is satisfied once the surf rules are satisfied (your watchlist definition)
+    out["signal"] = "WATCH"
+    out["score"] = int(min(100, max(1, 55 + min(25, bm["move_ret"] / 4.0) + min(10, surf["surf_bars"] / 5.0))))
+    out["reason"] = (
+        f"Big move {bm['move_ret']:.0f}% (<=63 bars, min 2 bars); "
+        f"first EMA touch at idx {surf['touch_idx']} ({surf['touch_ema']}); "
+        f"surf {surf['surf_bars']} bars, touch rate {surf['touch_frac']:.2f}; "
+        f"no lower lows since touch; bodies tightening; higher lows started"
+    )
 
-    pcfg = cfg.get("pattern", {}) or {}
-    rcfg = pcfg.get("risk", {}) or {}
-    max_stop_pct_trade = float(rcfg.get("max_stop_pct_trade", 12.0))
-    if not np.isnan(risk_pct) and risk_pct > max_stop_pct_trade:
-        out["reason"] = f"Risk too wide ({risk_pct:.1f}%)"
-        return out
-
-    # Scoring (purely to sort, not to decide)
-    score = 50
-    score += int(min(15, max(0.0, bm["move_ret"] / 6.0)))  # big move bonus
-    score += int(min(15, max(0.0, (cons["left_range_pct"] - cons["right_range_pct"]) * 1.2)))
-    score += int(min(10, cons["surf_frac"] * 10))
-    score += int(min(10, max(0.0, (cons["hl1_price"] / cons["hl0_price"] - 1.0) * 200.0)))
-    score = int(min(100, max(1, score)))
-
-    # Signal logic
-    if bo["crossed"] and bo["vol_ok"] and bo["tr_ok"] and bo["not_bad_reversal"]:
+    # 4) BUY trigger today: higher-low day with volume expansion
+    buy = buy_trigger_today(df_full, surf, cfg)
+    if buy.get("buy"):
         out["signal"] = "BUY_NOW"
-        out["entry"] = f"{entry_level:.2f}"
-        out["stop"] = f"{stop:.2f}"
-        out["score"] = score
+        out["entry"] = f"{float(buy['entry']):.2f}"
+        out["stop"] = f"{float(buy['stop']):.2f}"
+        out["score"] = int(min(100, out["score"] + 15))
         out["reason"] = (
-            f"Top performers filter passed, big move {bm['move_ret']:.0f}%, "
-            f"orderly consolidation {cons['cons_bars']}d (tighten {cons['left_range_pct']:.1f}%→{cons['right_range_pct']:.1f}%), "
-            f"HL {cons['hl0_price']:.2f}→{cons['hl1_price']:.2f}, "
-            f"breakout + vol (> {pcfg.get('breakout',{}).get('vol_mult_vs_50dma',1.4)}×50dma)"
+            out["reason"]
+            + f"; BUY on HL day with vol {buy['today_vol']:.0f} > {buy['vol_mult']:.2f}x{(cfg.get('pattern',{}).get('buy',{}).get('vol_ma',50))}dma"
         )
-        return out
+    else:
+        # For WATCH, give a useful stop reference: latest higher-low pivot low in the surf window (if any)
+        hl_left = int((cfg.get("pattern", {}) or {}).get("surf", {}).get("hl_left_bars", 3))
+        events = find_higher_low_events(df_full["low"], surf["touch_idx"], surf["surf_end_idx"], hl_left)
+        hl_events = [ev for ev in events if ev["is_hl"]]
+        if hl_events:
+            last_hl = hl_events[-1]
+            out["stop"] = f"{float(last_hl['low']):.2f}"
 
-    # WATCH if setup is valid and either near breakout or already crossed but volume/TR not confirming
-    near_pct = float((pcfg.get("breakout", {}) or {}).get("near_breakout_pct", 3.0))
-    today_close = float(df_full.iloc[-1]["close"])
-    near = today_close >= entry_level * (1.0 - near_pct / 100.0)
-
-    if bo["crossed"] and (not bo["vol_ok"] or not bo["tr_ok"]):
-        out["signal"] = "WATCH"
-        out["entry"] = f"{entry_level:.2f}"
-        out["stop"] = f"{stop:.2f}"
-        out["score"] = score
-        out["reason"] = (
-            f"Valid setup; breakout attempt but "
-            f"{'volume weak' if not bo['vol_ok'] else ''}"
-            f"{' & ' if (not bo['vol_ok'] and not bo['tr_ok']) else ''}"
-            f"{'range not expanding' if not bo['tr_ok'] else ''}"
-        )
-        return out
-
-    if near:
-        out["signal"] = "WATCH"
-        out["entry"] = f"{entry_level:.2f}"
-        out["stop"] = f"{stop:.2f}"
-        out["score"] = score
-        out["reason"] = (
-            f"Valid setup; near breakout level {entry_level:.2f} "
-            f"(cons {cons['cons_bars']}d, HL {cons['hl0_price']:.2f}→{cons['hl1_price']:.2f}, surf {cons['surf_frac']:.2f})"
-        )
-        return out
-
-    out["reason"] = "Valid setup but not near breakout"
-    out["score"] = score
     return out
 
 
@@ -772,10 +734,7 @@ def main():
         batch_size = 55
     batch_size = min(batch_size, max_credits_per_min)
 
-    # First pass: fetch all data and compute returns for ranking
-    series_by_sym: dict[str, pd.DataFrame] = {}
-    ret_rows = []  # (sym, r1m, r3m, r6m)
-
+    results: list[dict] = []
     errors = 0
     api_calls = 0
     credits_est = 0
@@ -796,82 +755,73 @@ def main():
             if isinstance(data, dict) and "values" in data:
                 sym = sym_batch[0]
                 df = normalise_timeseries_payload(sym, data)
-                if not df.empty:
-                    series_by_sym[sym] = df
-                    r1m = compute_returns(df, 21)
-                    r3m = compute_returns(df, 63)
-                    r6m = compute_returns(df, 126)
-                    ret_rows.append((sym, r1m, r3m, r6m))
+                if df.empty:
+                    results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "reason": data.get("message", "No data")})
+                else:
+                    r = detect_setup(df, cfg)
+                    results.append({"ticker": sym, **r})
             else:
                 # Multi-symbol response
                 for sym in sym_batch:
                     payload = data.get(sym, {}) if isinstance(data, dict) else {}
                     df = normalise_timeseries_payload(sym, payload)
                     if df.empty:
+                        results.append({
+                            "ticker": sym,
+                            "setup": SETUP_NAME,
+                            "signal": "PASS",
+                            "score": 0,
+                            "entry": "",
+                            "stop": "",
+                            "reason": payload.get("message", "No data"),
+                            "r1m": "",
+                            "r3m": "",
+                            "r6m": "",
+                            "move_ret": "",
+                            "surf_bars": "",
+                            "touch_frac": "",
+                            "touch_ema": "",
+                        })
                         continue
-                    series_by_sym[sym] = df
-                    r1m = compute_returns(df, 21)
-                    r3m = compute_returns(df, 63)
-                    r6m = compute_returns(df, 126)
-                    ret_rows.append((sym, r1m, r3m, r6m))
 
-        except Exception:
+                    r = detect_setup(df, cfg)
+                    results.append({"ticker": sym, **r})
+
+        except Exception as e:
+            for sym in sym_batch:
+                results.append({
+                    "ticker": sym,
+                    "setup": SETUP_NAME,
+                    "signal": "PASS",
+                    "score": 0,
+                    "entry": "",
+                    "stop": "",
+                    "reason": f"Fetch error: {type(e).__name__}",
+                    "r1m": "",
+                    "r3m": "",
+                    "r6m": "",
+                    "move_ret": "",
+                    "surf_bars": "",
+                    "touch_frac": "",
+                    "touch_ema": "",
+                })
             errors += 1
-            continue
-
-    if not series_by_sym:
-        raise SystemExit("No price series fetched successfully")
-
-    # Rank filter: top X% composite across 1m/3m/6m
-    rs_cfg = (cfg.get("relative_strength", {}) or {})
-    top_pct = float(rs_cfg.get("top_percent", 5.0))  # 1-5% typical
-    if top_pct <= 0:
-        top_pct = 5.0
-    if top_pct > 50:
-        top_pct = 50.0
-
-    rs = pd.DataFrame(ret_rows, columns=["sym", "r1m", "r3m", "r6m"]).dropna()
-    if rs.empty:
-        raise SystemExit("Not enough return data to rank the universe")
-
-    # Percentile ranks (higher return => higher rank)
-    rs["rk1m"] = rs["r1m"].rank(pct=True)
-    rs["rk3m"] = rs["r3m"].rank(pct=True)
-    rs["rk6m"] = rs["r6m"].rank(pct=True)
-    rs["rk"] = (rs["rk1m"] + rs["rk3m"] + rs["rk6m"]) / 3.0
-
-    # Threshold for top X%
-    thr = rs["rk"].quantile(1.0 - top_pct / 100.0)
-    top_syms = set(rs.loc[rs["rk"] >= thr, "sym"].tolist())
-
-    # Second pass: run pattern detector only on ranked universe
-    results: list[dict] = []
-    for sym, df in series_by_sym.items():
-        if sym not in top_syms:
-            results.append({
-                "ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "",
-                "reason": "Not in top performers filter", "r1m": "", "r3m": "", "r6m": ""
-            })
-            continue
-
-        r = detect_setup(df, cfg)
-        results.append({"ticker": sym, **r})
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    ws_signals = upsert_worksheet(sh, "Signals", rows=max(2000, len(results) + 10), cols=25)
-    ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=1000, cols=25)
-    ws_watch = upsert_worksheet(sh, "WATCH", rows=2000, cols=25)
+    ws_signals = upsert_worksheet(sh, "Signals", rows=max(2000, len(results) + 10), cols=30)
+    ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=1000, cols=30)
+    ws_watch = upsert_worksheet(sh, "WATCH", rows=2000, cols=30)
     ws_summary = upsert_worksheet(sh, "Summary", rows=80, cols=4)
     ws_log = upsert_worksheet(sh, "Run_Log", rows=1000, cols=12)
 
-    header = ["ticker", "setup", "signal", "score", "entry", "stop", "r1m_pct", "r3m_pct", "r6m_pct", "reason", "as_of_utc"]
+    header = ["ticker", "setup", "signal", "score", "entry", "stop", "r1m_pct", "r3m_pct", "r6m_pct", "move_ret_pct", "surf_bars", "touch_frac", "touch_ema", "reason", "as_of_utc"]
     signals_rows = [header]
 
-    buy_header = ["line", "ticker", "setup", "score", "entry", "stop", "r1m_pct", "r3m_pct", "r6m_pct", "reason", "as_of_utc"]
+    buy_header = ["line", "ticker", "setup", "score", "entry", "stop", "r1m_pct", "r3m_pct", "r6m_pct", "move_ret_pct", "surf_bars", "touch_frac", "touch_ema", "reason", "as_of_utc"]
     buy_rows = [buy_header]
 
-    watch_header = ["ticker", "setup", "score", "entry", "stop", "r1m_pct", "r3m_pct", "r6m_pct", "reason", "as_of_utc"]
+    watch_header = ["ticker", "setup", "score", "entry", "stop", "r1m_pct", "r3m_pct", "r6m_pct", "move_ret_pct", "surf_bars", "touch_frac", "touch_ema", "reason", "as_of_utc"]
     watch_rows = [watch_header]
 
     buy_items = []
@@ -889,17 +839,21 @@ def main():
         r1m = r.get("r1m", "")
         r3m = r.get("r3m", "")
         r6m = r.get("r6m", "")
+        move_ret = r.get("move_ret", "")
+        surf_bars = r.get("surf_bars", "")
+        touch_frac = r.get("touch_frac", "")
+        touch_ema = r.get("touch_ema", "")
 
-        signals_rows.append([sym, setup, sig, score, entry, stop, r1m, r3m, r6m, reason, now_utc])
+        signals_rows.append([sym, setup, sig, score, entry, stop, r1m, r3m, r6m, move_ret, surf_bars, touch_frac, touch_ema, reason, now_utc])
 
         sym_disp = display_ticker(sym)
 
         if sig == "BUY_NOW":
-            line = f"{sym_disp} – BUY NOW – Entry: {entry} – Stop: {stop} – 1m/3m/6m: {r1m}/{r3m}/{r6m}% – {reason}"
-            buy_items.append((score, [line, sym_disp, setup, score, entry, stop, r1m, r3m, r6m, reason, now_utc]))
+            line = f"{sym_disp} – BUY NOW – Entry: {entry} – Stop: {stop} – Move: {move_ret}% – Surf: {surf_bars} – Touch: {touch_frac} – {reason}"
+            buy_items.append((score, [line, sym_disp, setup, score, entry, stop, r1m, r3m, r6m, move_ret, surf_bars, touch_frac, touch_ema, reason, now_utc]))
 
         if sig == "WATCH":
-            watch_items.append((score, [sym_disp, setup, score, entry, stop, r1m, r3m, r6m, reason, now_utc]))
+            watch_items.append((score, [sym_disp, setup, score, entry, stop, r1m, r3m, r6m, move_ret, surf_bars, touch_frac, touch_ema, reason, now_utc]))
 
     buy_items.sort(key=lambda x: x[0], reverse=True)
     watch_items.sort(key=lambda x: x[0], reverse=True)
@@ -920,14 +874,12 @@ def main():
     watch_count = len(watch_items)
     pass_count = max(0, len(results) - buy_count - watch_count)
 
-    note = f"ok ({tickers_source}) paced at {max_credits_per_min}/min, batch_size={batch_size}, RS top {top_pct:.1f}%"
+    note = f"ok ({tickers_source}) paced at {max_credits_per_min}/min, batch_size={batch_size}"
 
     summary_rows = [
         ["key", "value"],
         ["last_run_utc", now_utc],
         ["tickers_scanned", str(len(tickers))],
-        ["fetched_series", str(len(series_by_sym))],
-        ["ranked_universe", str(len(top_syms))],
         ["results_rows", str(len(results))],
         ["buy_now_count", str(buy_count)],
         ["watch_count", str(watch_count)],
