@@ -8,62 +8,36 @@ api:
   # Provider per-minute cap (Grow 55 == 55 credits/min)
   max_api_credits_per_min: 50
 
-# 1) Relative strength filter: keep only the top X% performers
-relative_strength:
-  top_percent: 5.0   # set to 1.0–5.0 for your “1–5% up the most” universe
-
 pattern:
-  # 2) Big move sometime in last 1–3 months
+  # Big move higher (ends by yesterday at the latest)
   big_move:
-    lookback_bars: 63        # ~3 months
-    min_move_pct: 30.0       # 30–100%+
+    lookback_bars: 63
+    min_move_pct: 30.0
     max_move_pct: 1200.0
-    min_move_bars: 3         # “few days”
-    max_move_bars: 25        # “few weeks”
+    min_move_bars: 2
+    max_move_bars: 25
 
-  # 3) First orderly pullback + consolidation
-  consolidation:
-    min_bars: 8              # 8 days
-    max_bars: 42             # ~2 months
-    pivot_left: 3
-    pivot_right: 3
-
-    # tightening range requirement: right half range must be <= left half * this
-    tighten_right_to_left_mult: 0.75
-
-    # hard cap on consolidation range%
-    max_range_pct: 18.0
-
-  # 4) EMA surfing behaviour (10/20, sometimes 50)
-  ema_surf:
+  # Surf definition (your spec)
+  surf:
     ema10: 10
     ema20: 20
     ema50: 50
-    allow_50: true
 
-    # close must be within this % of at least one EMA to count as “surf”
-    max_close_dist_pct: 2.5
+    min_surf_bars: 2
+    max_surf_bars: 42
 
-    # minimum fraction of consolidation bars that must “surf”
-    min_surf_frac: 0.45
+    # Touches must be at least 1 in 2 bars
+    min_touch_frac: 0.50
 
-    # require 10/20 EMA rising through the consolidation
-    require_rising_emas: true
+    # Higher-low swing definition (realtime)
+    hl_left_bars: 3
 
-  # 5) Breakout + volume confirmation (BUY)
-  breakout:
-    price_trigger: close        # close or high
-    entry_buffer_pct: 0.20
-    near_breakout_pct: 3.0
+    # Tightening: open-to-close bodies trend smaller (negative slope)
+    # slope must be < this (keep it slightly negative to avoid noise)
+    body_slope_max: -0.000000001
 
-    # buy requires volume > vol_mult_vs_50dma * 50dma
-    vol_mult_vs_50dma: 1.40
+  # BUY trigger (your spec)
+  buy:
     vol_ma: 50
-
-    # range expansion proxy (TR% vs median)
-    require_tr_expansion: true
-    tr_mult_vs_median: 1.30
-    tr_median_lookback: 20
-
-  risk:
-    max_stop_pct_trade: 12.0
+    vol_mult_vs_ma: 1.40
+    require_green_candle: true
