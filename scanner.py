@@ -215,7 +215,7 @@ def pivot_low_centres(low: pd.Series, left: int, right: int) -> np.ndarray:
 
 def detect_runup_ema_touch_triangle(df: pd.DataFrame, cfg: dict) -> dict:
     """
-    WATCH trigger exactly when the PineScript triangle would be painted:
+    WATCH trigger when the PineScript triangle would be painted:
       - Breakout (close crosses above prior base high)
       - Run-up from last confirmed pivot low before breakout to the run-up top
       - Pullback from top >= minPullbackPct (basis low or close) and run-up >= minRunUpPct
@@ -253,7 +253,8 @@ def detect_runup_ema_touch_triangle(df: pd.DataFrame, cfg: dict) -> dict:
         "reason": "",
     }
 
-    if df is None or df.empty or len(df) < max(120, baseBars + pivotL + pivotR + 10, len50 + 10):
+    min_len = max(120, baseBars + pivotL + pivotR + 10, len50 + 10)
+    if df is None or df.empty or len(df) < min_len:
         out["reason"] = "Not enough daily data"
         return out
 
@@ -301,10 +302,9 @@ def detect_runup_ema_touch_triangle(df: pd.DataFrame, cfg: dict) -> dict:
     n = len(df)
 
     def last_pivot_before(x: int):
-        # last pivot low strictly before x
-        for i in range(len(lowIdxArr) - 1, -1, -1):
-            if lowIdxArr[i] < x:
-                return lowIdxArr[i], lowPxArr[i]
+        for j in range(len(lowIdxArr) - 1, -1, -1):
+            if lowIdxArr[j] < x:
+                return lowIdxArr[j], lowPxArr[j]
         return None, None
 
     for i in range(n):
@@ -350,7 +350,6 @@ def detect_runup_ema_touch_triangle(df: pd.DataFrame, cfg: dict) -> dict:
             trigger = pullingBack and (not np.isnan(rupPct)) and (rupPct >= minRunUpPct)
 
             if trigger:
-                # end run-up, arm touch search starting this bar
                 inRunUp = False
                 waitingForTouch = True
                 armedFrom = i
@@ -385,10 +384,15 @@ def detect_runup_ema_touch_triangle(df: pd.DataFrame, cfg: dict) -> dict:
                 waitingForTouch = False
                 armedFrom = None
 
-    # Only WATCH when the triangle would paint on the latest bar
+    # WATCH when the triangle would paint within the last N bars (default 5)
     last_bar = n - 1
-    if last_triangle_idx == last_bar:
-        dt = df["datetime"].iloc[last_bar]
+    last_n = int(rcfg.get("watch_last_n_bars", 5))
+    if last_n < 1:
+        last_n = 1
+    window_start = max(0, last_bar - (last_n - 1))
+
+    if last_triangle_idx is not None and last_triangle_idx >= window_start:
+        dt = df["datetime"].iloc[last_triangle_idx]
         dt_s = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)
 
         bdt_s = ""
@@ -411,7 +415,7 @@ def detect_runup_ema_touch_triangle(df: pd.DataFrame, cfg: dict) -> dict:
         out["score"] = int(round(last_runup_pct or 0.0))
         out["runup_pct"] = f"{(last_runup_pct or 0.0):.1f}"
         out["reason"] = (
-            f"Triangle today ({dt_s}) after run-up trigger; EMA{last_triangle_ema} touched 3 bars; "
+            f"Triangle on {dt_s} (last {last_n} bars); EMA{last_triangle_ema} touched 3 bars; "
             f"breakout {bdt_s}, top {tdt_s}, pullback-trigger {trdt_s}"
         )
         return out
@@ -424,10 +428,9 @@ def detect_runup_ema_touch_triangle(df: pd.DataFrame, cfg: dict) -> dict:
     elif last_trigger_idx is not None and last_triangle_idx is None:
         out["reason"] = "Run-up triggered but no 3-consecutive EMA touch afterwards"
     else:
-        # Triangle exists but not on latest bar
         tdt = df["datetime"].iloc[last_triangle_idx] if last_triangle_idx is not None else None
         tdt_s = tdt.strftime("%Y-%m-%d") if hasattr(tdt, "strftime") else (str(tdt) if tdt is not None else "")
-        out["reason"] = f"Triangle occurred on {tdt_s}, not on latest bar"
+        out["reason"] = f"Triangle occurred on {tdt_s}, not within last {last_n} bars"
 
     out["runup_pct"] = f"{(last_runup_pct or 0.0):.1f}" if last_runup_pct is not None else ""
     out["score"] = int(round(last_runup_pct or 0.0)) if last_runup_pct is not None else 0
@@ -570,10 +573,11 @@ def main():
                 sym = sym_batch[0]
                 df = normalise_timeseries_payload(sym, data)
                 if df.empty:
-                    results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "pivot": "", "base_weeks": "", "contractions": "", "depths": "", "risk_pct": "", "runup_pct": "", "reason": data.get("message", "No data")})
+                    results.append({"ticker": sym, **detect_setups(pd.DataFrame(), cfg)[0], "reason": data.get("message", "No data")})
                 else:
                     for r in detect_setups(df, cfg):
                         results.append({"ticker": sym, **r})
+
             else:
                 # Multi-symbol response
                 for sym in sym_batch:
@@ -582,17 +586,7 @@ def main():
                     if df.empty:
                         results.append({
                             "ticker": sym,
-                            "setup": SETUP_NAME,
-                            "signal": "PASS",
-                            "score": 0,
-                            "entry": "",
-                            "stop": "",
-                            "pivot": "",
-                            "base_weeks": "",
-                            "contractions": "",
-                            "depths": "",
-                            "risk_pct": "",
-                            "runup_pct": "",
+                            **detect_setups(pd.DataFrame(), cfg)[0],
                             "reason": payload.get("message", "No data"),
                         })
                         continue
@@ -604,17 +598,7 @@ def main():
             for sym in sym_batch:
                 results.append({
                     "ticker": sym,
-                    "setup": SETUP_NAME,
-                    "signal": "PASS",
-                    "score": 0,
-                    "entry": "",
-                    "stop": "",
-                    "pivot": "",
-                    "base_weeks": "",
-                    "contractions": "",
-                    "depths": "",
-                    "risk_pct": "",
-                    "runup_pct": "",
+                    **detect_setups(pd.DataFrame(), cfg)[0],
                     "reason": f"Fetch error: {type(e).__name__}",
                 })
             errors += 1
