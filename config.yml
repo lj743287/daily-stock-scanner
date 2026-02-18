@@ -23,3 +23,6 @@ runup_ema_touch:
   len50: 50
 
   priority: "10>20>50"     # or "Closest to Close"
+
+  # NEW: include triangles from the last N daily bars
+  watch_last_n_bars: 5
