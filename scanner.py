@@ -10,7 +10,7 @@ import numpy as np
 import gspread
 
 TD_BASE = "https://api.twelvedata.com/time_series"
-SETUP_NAME = "60D +30% Movers"
+SETUP_NAME = "RUN-UP + EMA Touch Triangle (10/20/50)"
 
 
 # ---------------------------
@@ -179,65 +179,267 @@ def normalise_timeseries_payload(symbol: str, payload: dict) -> pd.DataFrame:
 
 
 # ---------------------------
-# Core criterion: 60D return > 30%
+# Rule helpers (EMA, pivots, touch)
 # ---------------------------
 
-def pct_change(a: float, b: float) -> float:
-    if a == 0 or np.isnan(a) or np.isnan(b):
-        return np.nan
-    return 100.0 * (b / a - 1.0)
+def ema_series(s: pd.Series, length: int) -> pd.Series:
+    # TradingView ta.ema equivalent
+    return s.ewm(span=length, adjust=False).mean()
 
 
-def return_over_bars(df: pd.DataFrame, bars: int) -> float:
+def touches_level(low: pd.Series, high: pd.Series, level: pd.Series) -> pd.Series:
+    # Robust intrabar touch: low <= level <= high
+    return (low <= level) & (high >= level)
+
+
+def pivot_low_centres(low: pd.Series, left: int, right: int) -> np.ndarray:
     """
-    Return from close[-(bars+1)] to close[-1]
-    Example: bars=60 means approx last 60 trading days.
+    Centre-based pivot low test:
+      low[i] == min(low[i-left : i+right]) inclusive window.
     """
-    if df is None or df.empty or len(df) <= bars:
-        return np.nan
-    a = float(df["close"].iloc[-(bars + 1)])
-    b = float(df["close"].iloc[-1])
-    return pct_change(a, b)
+    n = len(low)
+    out = np.zeros(n, dtype=bool)
+    l = low.values
+    for i in range(left, n - right):
+        w = l[i - left:i + right + 1]
+        if np.isnan(l[i]) or np.isnan(w).all():
+            continue
+        if l[i] <= np.nanmin(w):
+            out[i] = True
+    return out
 
 
-def detect_60d_mover(df_full: pd.DataFrame, cfg: dict) -> dict:
+# ---------------------------
+# RUN-UP + EMA Touch Triangle detector (matches your Pine logic)
+# ---------------------------
+
+def detect_runup_ema_touch_triangle(df: pd.DataFrame, cfg: dict) -> dict:
     """
-    ONLY rule:
-      - if 60 trading day return > 30% -> WATCH
-      - else PASS
+    WATCH trigger exactly when the PineScript triangle would be painted:
+      - Breakout (close crosses above prior base high)
+      - Run-up from last confirmed pivot low before breakout to the run-up top
+      - Pullback from top >= minPullbackPct (basis low or close) and run-up >= minRunUpPct
+      - After trigger: FIRST time we get 3 consecutive EMA-touch bars on EMA10/20/50
+      - Triangle is on the 3rd consecutive touch bar (current bar)
+
+    keepHistory=false behaviour: only the latest triangle matters (we overwrite any earlier ones).
     """
-    rule = (cfg.get("rule", {}) or {})
-    bars = int(rule.get("lookback_bars", 60))
-    min_ret = float(rule.get("min_return_pct", 30.0))
+    rcfg = (cfg.get("runup_ema_touch", {}) or {})
+    baseBars = int(rcfg.get("baseBars", 20))
+    minRunUpPct = float(rcfg.get("minRunUpPct", 30.0))
+    minPullbackPct = float(rcfg.get("minPullbackPct", 5.0))
+    pivotL = int(rcfg.get("pivotL", 3))
+    pivotR = int(rcfg.get("pivotR", 3))
+    pullbackBasis = str(rcfg.get("pullbackBasis", "Close"))
+    priority = str(rcfg.get("priority", "10>20>50"))
 
-    if df_full is None or df_full.empty:
-        return {"signal": "PASS", "setup": SETUP_NAME, "score": 0, "entry": "", "stop": "", "ret_60d": "", "reason": "No data"}
+    emaSrcCol = str(rcfg.get("emaSrc", "close")).lower()
+    len10 = int(rcfg.get("len10", 10))
+    len20 = int(rcfg.get("len20", 20))
+    len50 = int(rcfg.get("len50", 50))
 
-    ret = return_over_bars(df_full, bars)
-    if np.isnan(ret):
-        return {"signal": "PASS", "setup": SETUP_NAME, "score": 0, "entry": "", "stop": "", "ret_60d": "", "reason": f"Not enough data for {bars} bars"}
-
-    if ret >= min_ret:
-        score = int(min(100, max(1, 50 + ret)))  # simple sorting score
-        return {
-            "signal": "WATCH",
-            "setup": SETUP_NAME,
-            "score": score,
-            "entry": "",
-            "stop": "",
-            "ret_60d": f"{ret:.1f}",
-            "reason": f"{bars}D return {ret:.1f}% ≥ {min_ret:.1f}%",
-        }
-
-    return {
+    out = {
         "signal": "PASS",
         "setup": SETUP_NAME,
         "score": 0,
         "entry": "",
         "stop": "",
-        "ret_60d": f"{ret:.1f}",
-        "reason": f"{bars}D return {ret:.1f}% < {min_ret:.1f}%",
+        "pivot": "",
+        "base_weeks": "",
+        "contractions": "",
+        "depths": "",
+        "risk_pct": "",
+        "runup_pct": "",
+        "reason": "",
     }
+
+    if df is None or df.empty or len(df) < max(120, baseBars + pivotL + pivotR + 10, len50 + 10):
+        out["reason"] = "Not enough daily data"
+        return out
+
+    # Inputs
+    src = df[emaSrcCol] if emaSrcCol in df.columns else df["close"]
+
+    ema10 = ema_series(src, len10)
+    ema20 = ema_series(src, len20)
+    ema50 = ema_series(src, len50)
+
+    t10 = touches_level(df["low"], df["high"], ema10)
+    t20 = touches_level(df["low"], df["high"], ema20)
+    t50 = touches_level(df["low"], df["high"], ema50)
+
+    t10_3 = t10 & t10.shift(1).fillna(False) & t10.shift(2).fillna(False)
+    t20_3 = t20 & t20.shift(1).fillna(False) & t20.shift(2).fillna(False)
+    t50_3 = t50 & t50.shift(1).fillna(False) & t50.shift(2).fillna(False)
+
+    priorBaseHigh = df["high"].rolling(baseBars).max().shift(1)
+    breakoutNow = (df["close"] > priorBaseHigh) & (df["close"].shift(1) <= priorBaseHigh)
+
+    # Pivot low centres + confirmation timing (matches ta.pivotlow(..., L, R))
+    piv_centres = pivot_low_centres(df["low"], pivotL, pivotR)
+
+    # State (matches Pine)
+    lowIdxArr: list[int] = []
+    lowPxArr: list[float] = []
+
+    inRunUp = False
+    waitingForTouch = False
+    armedFrom = None
+
+    anchorX = None
+    anchorPx = None
+    topX = None
+    topPx = None
+
+    last_triangle_idx = None
+    last_triangle_ema = None
+    last_runup_pct = None
+    last_breakout_idx = None
+    last_runup_top_idx = None
+    last_trigger_idx = None
+
+    n = len(df)
+
+    def last_pivot_before(x: int):
+        # last pivot low strictly before x
+        for i in range(len(lowIdxArr) - 1, -1, -1):
+            if lowIdxArr[i] < x:
+                return lowIdxArr[i], lowPxArr[i]
+        return None, None
+
+    for i in range(n):
+        # Confirm pivots when we reach centre + pivotR
+        centre = i - pivotR
+        if centre >= 0 and piv_centres[centre]:
+            lowIdxArr.append(centre)
+            lowPxArr.append(float(df["low"].iloc[centre]))
+
+        # Breakout detection
+        if bool(breakoutNow.iloc[i]):
+            ax, ap = last_pivot_before(i)
+            if ax is not None and ap is not None and ap > 0:
+                inRunUp = True
+                waitingForTouch = False
+                armedFrom = None
+
+                anchorX = ax
+                anchorPx = float(ap)
+                topX = i
+                topPx = float(df["high"].iloc[i])
+
+                last_breakout_idx = i
+                last_runup_top_idx = i
+                last_trigger_idx = None
+
+        # Track top, then trigger run-up label on pullback
+        if inRunUp and anchorPx is not None and topPx is not None:
+            hi = float(df["high"].iloc[i])
+            if hi >= float(topPx):
+                topPx = hi
+                topX = i
+                last_runup_top_idx = i
+
+            basisPx = float(df["low"].iloc[i]) if pullbackBasis.lower() == "low" else float(df["close"].iloc[i])
+            pbPct = ((topPx - basisPx) / topPx) * 100.0 if topPx > 0 else np.nan
+
+            pullingBack = (topX is not None) and (i > topX) and (not np.isnan(pbPct)) and (pbPct >= minPullbackPct) and (hi < topPx)
+
+            chg = float(topPx) - float(anchorPx)
+            rupPct = (chg / float(anchorPx)) * 100.0 if anchorPx > 0 else np.nan
+
+            trigger = pullingBack and (not np.isnan(rupPct)) and (rupPct >= minRunUpPct)
+
+            if trigger:
+                # end run-up, arm touch search starting this bar
+                inRunUp = False
+                waitingForTouch = True
+                armedFrom = i
+
+                last_runup_pct = float(rupPct)
+                last_trigger_idx = i
+
+        # After run-up trigger: FIRST EMA touch for 3 consecutive bars
+        if waitingForTouch and armedFrom is not None and i >= armedFrom:
+            anyTouch3 = bool(t10_3.iloc[i]) or bool(t20_3.iloc[i]) or bool(t50_3.iloc[i])
+            if anyTouch3:
+                which = None
+                if priority == "10>20>50":
+                    which = 10 if bool(t10_3.iloc[i]) else 20 if bool(t20_3.iloc[i]) else 50
+                else:
+                    d10 = abs(float(df["close"].iloc[i]) - float(ema10.iloc[i]))
+                    d20 = abs(float(df["close"].iloc[i]) - float(ema20.iloc[i]))
+                    d50 = abs(float(df["close"].iloc[i]) - float(ema50.iloc[i]))
+                    candidates = []
+                    if bool(t10_3.iloc[i]):
+                        candidates.append((d10, 10))
+                    if bool(t20_3.iloc[i]):
+                        candidates.append((d20, 20))
+                    if bool(t50_3.iloc[i]):
+                        candidates.append((d50, 50))
+                    which = sorted(candidates, key=lambda x: x[0])[0][1] if candidates else 50
+
+                # keepHistory=false => overwrite any prior triangle
+                last_triangle_idx = i
+                last_triangle_ema = which
+
+                waitingForTouch = False
+                armedFrom = None
+
+    # Only WATCH when the triangle would paint on the latest bar
+    last_bar = n - 1
+    if last_triangle_idx == last_bar:
+        dt = df["datetime"].iloc[last_bar]
+        dt_s = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)
+
+        bdt_s = ""
+        tdt_s = ""
+        trdt_s = ""
+
+        if last_breakout_idx is not None:
+            bdt = df["datetime"].iloc[last_breakout_idx]
+            bdt_s = bdt.strftime("%Y-%m-%d") if hasattr(bdt, "strftime") else str(bdt)
+
+        if last_runup_top_idx is not None:
+            tdt = df["datetime"].iloc[last_runup_top_idx]
+            tdt_s = tdt.strftime("%Y-%m-%d") if hasattr(tdt, "strftime") else str(tdt)
+
+        if last_trigger_idx is not None:
+            trdt = df["datetime"].iloc[last_trigger_idx]
+            trdt_s = trdt.strftime("%Y-%m-%d") if hasattr(trdt, "strftime") else str(trdt)
+
+        out["signal"] = "WATCH"
+        out["score"] = int(round(last_runup_pct or 0.0))
+        out["runup_pct"] = f"{(last_runup_pct or 0.0):.1f}"
+        out["reason"] = (
+            f"Triangle today ({dt_s}) after run-up trigger; EMA{last_triangle_ema} touched 3 bars; "
+            f"breakout {bdt_s}, top {tdt_s}, pullback-trigger {trdt_s}"
+        )
+        return out
+
+    # PASS reason (useful for debugging)
+    if last_trigger_idx is None and last_breakout_idx is None:
+        out["reason"] = "No breakout run-up cycle found"
+    elif last_trigger_idx is None and last_breakout_idx is not None:
+        out["reason"] = "Breakout seen but no run-up trigger (pullback/run-up thresholds not met)"
+    elif last_trigger_idx is not None and last_triangle_idx is None:
+        out["reason"] = "Run-up triggered but no 3-consecutive EMA touch afterwards"
+    else:
+        # Triangle exists but not on latest bar
+        tdt = df["datetime"].iloc[last_triangle_idx] if last_triangle_idx is not None else None
+        tdt_s = tdt.strftime("%Y-%m-%d") if hasattr(tdt, "strftime") else (str(tdt) if tdt is not None else "")
+        out["reason"] = f"Triangle occurred on {tdt_s}, not on latest bar"
+
+    out["runup_pct"] = f"{(last_runup_pct or 0.0):.1f}" if last_runup_pct is not None else ""
+    out["score"] = int(round(last_runup_pct or 0.0)) if last_runup_pct is not None else 0
+    return out
+
+
+# ---------------------------
+# Setups wrapper (one row per ticker per setup)
+# ---------------------------
+
+def detect_setups(df_full: pd.DataFrame, cfg: dict) -> list[dict]:
+    return [detect_runup_ema_touch_triangle(df_full, cfg)]
 
 
 # ---------------------------
@@ -335,7 +537,7 @@ def main():
         raise SystemExit("No tickers found (Tickers tab empty and tickers.txt empty)")
 
     interval = cfg.get("api", {}).get("interval", "1day")
-    outputsize = int(cfg.get("api", {}).get("outputsize", 200))  # 60D calc needs ~61 bars; keep a buffer
+    outputsize = int(cfg.get("api", {}).get("outputsize", 520))
 
     max_credits_per_min = int(cfg.get("api", {}).get("max_api_credits_per_min", 55))
     if max_credits_per_min < 1:
@@ -368,10 +570,10 @@ def main():
                 sym = sym_batch[0]
                 df = normalise_timeseries_payload(sym, data)
                 if df.empty:
-                    results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "ret_60d": "", "reason": data.get("message", "No data")})
+                    results.append({"ticker": sym, "setup": SETUP_NAME, "signal": "PASS", "score": 0, "entry": "", "stop": "", "pivot": "", "base_weeks": "", "contractions": "", "depths": "", "risk_pct": "", "runup_pct": "", "reason": data.get("message", "No data")})
                 else:
-                    r = detect_60d_mover(df, cfg)
-                    results.append({"ticker": sym, **r})
+                    for r in detect_setups(df, cfg):
+                        results.append({"ticker": sym, **r})
             else:
                 # Multi-symbol response
                 for sym in sym_batch:
@@ -385,13 +587,18 @@ def main():
                             "score": 0,
                             "entry": "",
                             "stop": "",
-                            "ret_60d": "",
+                            "pivot": "",
+                            "base_weeks": "",
+                            "contractions": "",
+                            "depths": "",
+                            "risk_pct": "",
+                            "runup_pct": "",
                             "reason": payload.get("message", "No data"),
                         })
                         continue
 
-                    r = detect_60d_mover(df, cfg)
-                    results.append({"ticker": sym, **r})
+                    for r in detect_setups(df, cfg):
+                        results.append({"ticker": sym, **r})
 
         except Exception as e:
             for sym in sym_batch:
@@ -402,26 +609,31 @@ def main():
                     "score": 0,
                     "entry": "",
                     "stop": "",
-                    "ret_60d": "",
+                    "pivot": "",
+                    "base_weeks": "",
+                    "contractions": "",
+                    "depths": "",
+                    "risk_pct": "",
+                    "runup_pct": "",
                     "reason": f"Fetch error: {type(e).__name__}",
                 })
             errors += 1
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    ws_signals = upsert_worksheet(sh, "Signals", rows=max(2000, len(results) + 10), cols=25)
+    ws_signals = upsert_worksheet(sh, "Signals", rows=max(2000, len(results) + 10), cols=20)
     ws_buys = upsert_worksheet(sh, "BUY_NOW", rows=1000, cols=20)
-    ws_watch = upsert_worksheet(sh, "WATCH", rows=2000, cols=25)
+    ws_watch = upsert_worksheet(sh, "WATCH", rows=2000, cols=20)
     ws_summary = upsert_worksheet(sh, "Summary", rows=80, cols=4)
     ws_log = upsert_worksheet(sh, "Run_Log", rows=1000, cols=12)
 
-    header = ["ticker", "setup", "signal", "score", "ret_60d_pct", "reason", "as_of_utc"]
+    header = ["ticker", "setup", "signal", "score", "entry", "stop", "pivot", "base_weeks", "contractions", "depths_pct", "risk_pct", "runup_pct", "reason", "as_of_utc"]
     signals_rows = [header]
 
-    buy_header = ["line", "ticker", "setup", "score", "reason", "as_of_utc"]
+    buy_header = ["line", "ticker", "setup", "score", "entry", "stop", "pivot", "base_weeks", "contractions", "risk_pct", "reason", "as_of_utc"]
     buy_rows = [buy_header]
 
-    watch_header = ["ticker", "setup", "score", "ret_60d_pct", "reason", "as_of_utc"]
+    watch_header = ["ticker", "setup", "score", "entry", "stop", "pivot", "base_weeks", "contractions", "risk_pct", "reason", "as_of_utc"]
     watch_rows = [watch_header]
 
     buy_items = []
@@ -432,17 +644,31 @@ def main():
         setup = r.get("setup", SETUP_NAME)
         sig = r.get("signal", "PASS")
         score = int(r.get("score", 0) or 0)
-        ret60 = r.get("ret_60d", "")
+        entry = r.get("entry", "")
+        stop = r.get("stop", "")
+        pivot = r.get("pivot", "")
+        base_weeks = r.get("base_weeks", "")
+        contractions = r.get("contractions", "")
+        depths = r.get("depths", "")
+        risk_pct = r.get("risk_pct", "")
+        runup_pct = r.get("runup_pct", "")
         reason = r.get("reason", "")
 
-        signals_rows.append([sym, setup, sig, score, ret60, reason, now_utc])
+        signals_rows.append([sym, setup, sig, score, entry, stop, pivot, base_weeks, contractions, depths, risk_pct, runup_pct, reason, now_utc])
 
         sym_disp = display_ticker(sym)
 
-        if sig == "WATCH":
-            watch_items.append((score, [sym_disp, setup, score, ret60, reason, now_utc]))
+        if sig == "BUY_NOW":
+            line = f"{sym_disp} – BUY NOW – Setup: {setup} – Entry: {entry} – Stop: {stop} – Reason: {reason}"
+            buy_items.append((score, [line, sym_disp, setup, score, entry, stop, pivot, base_weeks, contractions, risk_pct, reason, now_utc]))
 
+        if sig == "WATCH":
+            watch_items.append((score, [sym_disp, setup, score, entry, stop, pivot, base_weeks, contractions, risk_pct, reason, now_utc]))
+
+    buy_items.sort(key=lambda x: x[0], reverse=True)
     watch_items.sort(key=lambda x: x[0], reverse=True)
+
+    buy_rows.extend([row for _, row in buy_items])
     watch_rows.extend([row for _, row in watch_items])
 
     ws_signals.clear()
@@ -454,7 +680,7 @@ def main():
     ws_watch.clear()
     ws_watch.update("A1", watch_rows)
 
-    buy_count = 0
+    buy_count = len(buy_items)
     watch_count = len(watch_items)
     pass_count = max(0, len(results) - buy_count - watch_count)
 
@@ -485,9 +711,9 @@ def main():
         value_input_option="USER_ENTERED",
     )
 
-    print("WATCH signals (60D movers):")
-    for _, row in watch_items:
-        print(f"{row[0]} – 60D {row[3]}% – {row[4]}")
+    print("WATCH signals:")
+    for _, r in watch_items[:20]:
+        print(r[0])
     print(f"Done. tickers={len(tickers)} results={len(results)} watch={watch_count} pass={pass_count} errors={errors} api_calls={api_calls} credits_est={credits_est} source={tickers_source}")
 
 
