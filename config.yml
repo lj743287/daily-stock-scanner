@@ -1,8 +1,6 @@
 api:
   interval: 1day
-
-  # Enough history for a 60-trading-day return calc (+ buffer)
-  outputsize: 200
+  outputsize: 520
 
   # Batch symbols per API call (1 symbol ~= 1 credit)
   batch_size: 50
@@ -10,6 +8,18 @@ api:
   # Provider per-minute cap (Grow 55 == 55 credits/min)
   max_api_credits_per_min: 50
 
-rule:
-  lookback_bars: 60
-  min_return_pct: 30.0
+# RUN-UP + EMA Touch Triangle (10/20/50) logic
+runup_ema_touch:
+  baseBars: 20
+  minRunUpPct: 30.0
+  minPullbackPct: 5.0
+  pivotL: 3
+  pivotR: 3
+  pullbackBasis: "Close"   # "Low" or "Close"
+
+  emaSrc: "close"          # close by default
+  len10: 10
+  len20: 20
+  len50: 50
+
+  priority: "10>20>50"     # or "Closest to Close"
