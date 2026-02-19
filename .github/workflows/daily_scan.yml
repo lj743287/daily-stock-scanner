@@ -3,8 +3,8 @@ name: Daily Scan (build universe + scan)
 on:
   workflow_dispatch:
   schedule:
-    # Daily at 06:15 UTC (adjust if you like)
-    - cron: "15 6 * * *"
+    # Daily at 01:00 UTC
+    - cron: "0 1 * * *"
 
 permissions:
   contents: write
@@ -46,7 +46,6 @@ jobs:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           UNIVERSE_MIN_PRICE: "1.50"
           TD_MAX_REQUESTS_PER_MINUTE: "50"
-          UNIVERSE_MAX_SYMBOLS: "50"
           UNIVERSE_OUTFILE: "universe.txt"
         run: |
           python build_universe.py
@@ -62,7 +61,6 @@ jobs:
             git add universe.txt
             git commit -m "Update universe.txt" || echo "Nothing to commit"
 
-            # If main advanced while we were building, rebase safely then push
             git fetch origin main
             git rebase origin/main || (git rebase --abort && exit 1)
 
