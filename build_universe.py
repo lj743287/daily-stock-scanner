@@ -8,25 +8,25 @@ Builds universe.txt from Twelve Data:
 - Filter: price > 1.50 using /price endpoint
 - Writes: universe.txt (one symbol per line) sorted A-Z
 
-Designed to run in GitHub Actions and commit the updated universe.txt back to the repo.
+Hardened for GitHub Actions:
+- Short timeouts, retries, and unbuffered logging (flush=True)
 """
 
 import os
-import sys
 import time
 import json
 import math
 from typing import List, Optional
 import urllib.parse
 import urllib.request
-
+import urllib.error
 
 BASE_URL = "https://api.twelvedata.com"
 
 
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    if v is None or v.strip() == "":
+    if not v or not v.strip():
         return default
     try:
         return int(v)
@@ -36,22 +36,12 @@ def env_int(name: str, default: int) -> int:
 
 def env_float(name: str, default: float) -> float:
     v = os.getenv(name)
-    if v is None or v.strip() == "":
+    if not v or not v.strip():
         return default
     try:
         return float(v)
     except ValueError:
         return default
-
-
-def http_get_json(url: str, timeout: int = 30) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": "daily-stock-scanner/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = resp.read().decode("utf-8")
-    try:
-        return json.loads(data)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"Non-JSON response from Twelve Data. URL={url} Body={data[:2000]}")
 
 
 class RateLimiter:
@@ -74,12 +64,28 @@ class RateLimiter:
 
         if self.count >= self.max_per_minute:
             sleep_for = max(0.0, 60 - elapsed) + 0.25
-            print(f"[pacing] Hit {self.max_per_minute}/min, sleeping {sleep_for:.2f}s")
+            print(f"[pacing] Hit {self.max_per_minute}/min, sleeping {sleep_for:.2f}s", flush=True)
             time.sleep(sleep_for)
             self.window_start = time.time()
             self.count = 0
 
         self.count += 1
+
+
+def http_get_json(url: str, timeout: int = 10, retries: int = 3) -> dict:
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "daily-stock-scanner/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read().decode("utf-8")
+            return json.loads(data)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+            last_err = e
+            backoff = 1.5 * attempt
+            print(f"[http] attempt {attempt}/{retries} failed: {type(e).__name__}: {e} | sleeping {backoff:.1f}s", flush=True)
+            time.sleep(backoff)
+    raise RuntimeError(f"HTTP failed after {retries} retries. URL={url} LastError={last_err}")
 
 
 def build_stocks_catalog(apikey: str, exchange: str) -> List[dict]:
@@ -92,12 +98,6 @@ def build_stocks_catalog(apikey: str, exchange: str) -> List[dict]:
 
 
 def is_stock(rec: dict) -> bool:
-    """
-    Deterministic stock-only filter.
-
-    Keep common equity-like instruments, exclude ETFs by construction.
-    Tighten to {"Common Stock"} later if you wish.
-    """
     t = (rec.get("type") or "").strip()
     keep = {"Common Stock", "Depositary Receipt", "American Depositary Receipt", "REIT"}
     return t in keep
@@ -130,40 +130,45 @@ def write_universe(path: str, symbols: List[str]) -> None:
 def main() -> int:
     apikey = os.getenv("TWELVE_DATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY") or ""
     if not apikey:
-        print("ERROR: Missing Twelve Data API key. Set TWELVE_DATA_API_KEY (or TWELVEDATA_API_KEY).")
+        print("ERROR: Missing Twelve Data API key. Set TWELVE_DATA_API_KEY (or TWELVEDATA_API_KEY).", flush=True)
         return 2
 
     min_price = env_float("UNIVERSE_MIN_PRICE", 1.50)
     max_per_minute = env_int("TD_MAX_REQUESTS_PER_MINUTE", 50)
     max_symbols = env_int("UNIVERSE_MAX_SYMBOLS", 0)  # 0 = no cap
+    out_path = os.getenv("UNIVERSE_OUTFILE", "universe.txt")
 
     limiter = RateLimiter(max_per_minute)
 
-    exchanges = ["NASDAQ", "NYSE"]
+    print("[universe] Starting build...", flush=True)
+    print(f"[universe] min_price={min_price:.2f} max_per_minute={max_per_minute} max_symbols={max_symbols or 'none'} outfile={out_path}", flush=True)
 
-    print("[universe] Fetching symbol catalog from Twelve Data /stocks ...")
+    exchanges = ["NASDAQ", "NYSE"]
     all_recs: List[dict] = []
+
+    print("[universe] Fetching symbol catalog from /stocks ...", flush=True)
     for ex in exchanges:
         limiter.wait()
         recs = build_stocks_catalog(apikey, ex)
-        print(f"[universe] {ex}: {len(recs)} rows from /stocks")
+        print(f"[universe] {ex}: {len(recs)} rows from /stocks", flush=True)
         all_recs.extend(recs)
 
     stock_recs = [r for r in all_recs if is_stock(r)]
-    print(f"[universe] After stock-only filter: {len(stock_recs)}")
+    print(f"[universe] After stock-only filter: {len(stock_recs)}", flush=True)
 
     symbols = sorted(set((r.get("symbol") or "").strip() for r in stock_recs if (r.get("symbol") or "").strip()))
-    print(f"[universe] Unique symbols pre-price-filter: {len(symbols)}")
+    print(f"[universe] Unique symbols pre-price-filter: {len(symbols)}", flush=True)
 
     if max_symbols and max_symbols > 0:
         symbols = symbols[:max_symbols]
-        print(f"[universe] TEST MODE: limiting to first {max_symbols} symbols")
+        print(f"[universe] TEST MODE: limiting to first {max_symbols} symbols", flush=True)
 
     kept: List[str] = []
     skipped_no_price = 0
     skipped_below = 0
 
-    print(f"[universe] Applying price filter > {min_price:.2f} using /price (paced at {max_per_minute}/min) ...")
+    print(f"[universe] Applying price filter > {min_price:.2f} using /price ...", flush=True)
+
     for i, sym in enumerate(symbols, start=1):
         limiter.wait()
         px = fetch_price(apikey, sym)
@@ -175,18 +180,17 @@ def main() -> int:
             else:
                 skipped_below += 1
 
-        if i % 100 == 0:
-            print(f"[universe] progress {i}/{len(symbols)} kept={len(kept)} no_price={skipped_no_price} below={skipped_below}")
+        if i % 50 == 0:
+            print(f"[universe] progress {i}/{len(symbols)} kept={len(kept)} no_price={skipped_no_price} below={skipped_below}", flush=True)
 
-    out_path = os.getenv("UNIVERSE_OUTFILE", "universe.txt")
     write_universe(out_path, kept)
 
-    print("[universe] Done.")
-    print(f"[universe] wrote: {out_path}")
-    print(f"[universe] kept: {len(kept)}")
-    print(f"[universe] skipped_no_price: {skipped_no_price}")
-    print(f"[universe] skipped_below_threshold: {skipped_below}")
-    print("[universe] preview:", ", ".join(kept[:20]))
+    print("[universe] Done.", flush=True)
+    print(f"[universe] wrote: {out_path}", flush=True)
+    print(f"[universe] kept: {len(kept)}", flush=True)
+    print(f"[universe] skipped_no_price: {skipped_no_price}", flush=True)
+    print(f"[universe] skipped_below_threshold: {skipped_below}", flush=True)
+    print("[universe] preview:", ", ".join(kept[:20]), flush=True)
 
     return 0
 
