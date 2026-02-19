@@ -47,12 +47,23 @@ jobs:
       - name: Commit and push updated universe.txt (if changed)
         run: |
           set -e
+
+          # Ensure we are on main and up to date
+          git fetch origin main
+          git checkout main
+          git pull --rebase origin main
+
+          # Only continue if universe.txt changed or is new
           if git status --porcelain | grep -q "^ M universe.txt\|^?? universe.txt"; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
             git add universe.txt
-            git commit -m "Update universe.txt"
-            git push
+            git commit -m "Update universe.txt" || echo "Nothing to commit"
+
+            # Rebase again in case main advanced while we were committing
+            git pull --rebase origin main
+            git push origin main
           else
             echo "No changes to universe.txt"
           fi
