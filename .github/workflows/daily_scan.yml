@@ -36,7 +36,7 @@ jobs:
 
       - name: Build universe.txt from Twelve Data
         env:
-          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           UNIVERSE_MIN_PRICE: "1.50"
           # Set this to your Twelve Data per-minute cap (example 450/min)
           TD_MAX_REQUESTS_PER_MINUTE: "450"
@@ -59,7 +59,7 @@ jobs:
 
       - name: Run daily scanner
         env:
-          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
