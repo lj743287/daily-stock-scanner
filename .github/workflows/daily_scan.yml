@@ -39,7 +39,7 @@ jobs:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           UNIVERSE_MIN_PRICE: "1.50"
           # Set this to your Twelve Data per-minute cap (example 450/min)
-          TD_MAX_REQUESTS_PER_MINUTE: "450"
+          TD_MAX_REQUESTS_PER_MINUTE: "54"
           UNIVERSE_OUTFILE: "universe.txt"
         run: |
           python build_universe.py
