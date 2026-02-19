@@ -69,39 +69,6 @@ def read_tickers_from_file(path: str) -> list[str]:
         return parse_symbols_from_text(f.read())
 
 
-def read_tickers_from_sheet(sh) -> list[str]:
-    """
-    Looks for a worksheet called 'Tickers'.
-    Preferred:
-      - A2 contains the TradingView export string (one long line is fine)
-    Also supports:
-      - Column A contains one symbol per row (starting A2)
-    """
-    try:
-        ws = sh.worksheet("Tickers")
-    except Exception:
-        return []
-
-    values = ws.col_values(1)  # column A
-    if not values:
-        return []
-
-    a2 = values[1].strip() if len(values) >= 2 and values[1] else ""
-    if a2:
-        return parse_symbols_from_text(a2)
-
-    lines = []
-    for i, v in enumerate(values):
-        if i == 0:
-            continue
-        v = (v or "").strip()
-        if not v:
-            continue
-        lines.append(v)
-
-    return parse_symbols_from_text("\n".join(lines))
-
-
 def display_ticker(sym: str) -> str:
     # Convert MSFT:NASDAQ -> MSFT for display
     if ":" in sym:
@@ -572,12 +539,13 @@ def rate_limit_wait(batch_credits: int, max_credits_per_min: int, state: dict) -
 # ---------------------------
 
 def main():
-    td_key = os.environ.get("TWELVEDATA_API_KEY", "").strip()
+    # Accept either name (workflow sets TWELVE_DATA_API_KEY, older setups used TWELVEDATA_API_KEY)
+    td_key = (os.environ.get("TWELVE_DATA_API_KEY", "") or os.environ.get("TWELVEDATA_API_KEY", "")).strip()
     sheet_id = os.environ.get("SHEET_ID", "").strip()
     sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
     if not td_key or not sheet_id or not sa_json:
-        raise SystemExit("Missing one or more secrets: TWELVEDATA_API_KEY, SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON")
+        raise SystemExit("Missing one or more secrets: TWELVE_DATA_API_KEY/TWELVEDATA_API_KEY, SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON")
 
     with open("config.yml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
@@ -585,14 +553,19 @@ def main():
     gc = get_gspread_client(sa_json)
     sh = gc.open_by_key(sheet_id)
 
-    tickers = read_tickers_from_sheet(sh)
-    tickers_source = "sheet"
-    if not tickers:
-        tickers = read_tickers_from_file("tickers.txt")
-        tickers_source = "file"
+    # --- NEW: ticker source is universe file in repo ---
+    universe_file = os.environ.get("UNIVERSE_FILE", "universe.txt").strip() or "universe.txt"
+    tickers = read_tickers_from_file(universe_file)
+    tickers_source = f"universe:{universe_file}"
 
     if not tickers:
-        raise SystemExit("No tickers found (Tickers tab empty and tickers.txt empty)")
+        raise SystemExit(f"No tickers found in {universe_file}")
+
+    # Optional: cap tickers for testing scan runtime
+    max_tickers = int(os.environ.get("UNIVERSE_MAX_TICKERS", "0") or "0")
+    if max_tickers and max_tickers > 0:
+        tickers = tickers[:max_tickers]
+        tickers_source += f" (capped {max_tickers})"
 
     interval = cfg.get("api", {}).get("interval", "1day")
     outputsize = int(cfg.get("api", {}).get("outputsize", 520))
