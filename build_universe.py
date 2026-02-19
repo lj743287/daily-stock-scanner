@@ -16,7 +16,7 @@ import sys
 import time
 import json
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 import urllib.parse
 import urllib.request
 
@@ -55,10 +55,7 @@ def http_get_json(url: str, timeout: int = 30) -> dict:
 
 
 class RateLimiter:
-    """
-    Simple per-minute throttler. Ensures we do not exceed MAX_REQUESTS_PER_MINUTE.
-    Uses a rolling window with sleep.
-    """
+    """Simple per-minute throttler (rolling 60s window)."""
 
     def __init__(self, max_per_minute: int):
         self.max_per_minute = max_per_minute
@@ -68,15 +65,15 @@ class RateLimiter:
     def wait(self) -> None:
         if self.max_per_minute <= 0:
             return
+
         now = time.time()
         elapsed = now - self.window_start
         if elapsed >= 60:
-            # reset window
             self.window_start = now
             self.count = 0
 
         if self.count >= self.max_per_minute:
-            sleep_for = max(0.0, 60 - elapsed) + 0.25  # small buffer
+            sleep_for = max(0.0, 60 - elapsed) + 0.25
             print(f"[pacing] Hit {self.max_per_minute}/min, sleeping {sleep_for:.2f}s")
             time.sleep(sleep_for)
             self.window_start = time.time()
@@ -86,7 +83,6 @@ class RateLimiter:
 
 
 def build_stocks_catalog(apikey: str, exchange: str) -> List[dict]:
-    # Twelve Data /stocks supports exchange filter and includes 'type' per symbol.
     q = urllib.parse.urlencode({"apikey": apikey, "exchange": exchange})
     url = f"{BASE_URL}/stocks?{q}"
     data = http_get_json(url)
@@ -95,19 +91,12 @@ def build_stocks_catalog(apikey: str, exchange: str) -> List[dict]:
     return data.get("data", [])
 
 
-def is_common_stock(rec: dict) -> bool:
+def is_stock(rec: dict) -> bool:
     """
     Deterministic stock-only filter.
 
-    Twelve Data /stocks returns 'type' such as:
-    - Common Stock
-    - ETF
-    - Preferred Stock
-    - REIT
-    etc.
-
-    We keep Common Stock and a couple of stock-like categories that are often traded as equities
-    (you can tighten later if you wish).
+    Keep common equity-like instruments, exclude ETFs by construction.
+    Tighten to {"Common Stock"} later if you wish.
     """
     t = (rec.get("type") or "").strip()
     keep = {"Common Stock", "Depositary Receipt", "American Depositary Receipt", "REIT"}
@@ -115,19 +104,16 @@ def is_common_stock(rec: dict) -> bool:
 
 
 def fetch_price(apikey: str, symbol: str) -> Optional[float]:
-    # /price is the cheapest way to get latest price (returns {"price":"..."}), 1 credit per symbol.
     q = urllib.parse.urlencode({"apikey": apikey, "symbol": symbol})
     url = f"{BASE_URL}/price?{q}"
     data = http_get_json(url)
 
-    # success: {"price":"200.99"}
     if "price" in data and data.get("price") not in (None, ""):
         try:
             return float(data["price"])
         except (TypeError, ValueError):
             return None
 
-    # error: {"status":"error","message":"..."}
     if data.get("status") == "error":
         return None
 
@@ -148,7 +134,9 @@ def main() -> int:
         return 2
 
     min_price = env_float("UNIVERSE_MIN_PRICE", 1.50)
-    max_per_minute = env_int("TD_MAX_REQUESTS_PER_MINUTE", 450)  # set to your plan cap
+    max_per_minute = env_int("TD_MAX_REQUESTS_PER_MINUTE", 50)
+    max_symbols = env_int("UNIVERSE_MAX_SYMBOLS", 0)  # 0 = no cap
+
     limiter = RateLimiter(max_per_minute)
 
     exchanges = ["NASDAQ", "NYSE"]
@@ -161,27 +149,21 @@ def main() -> int:
         print(f"[universe] {ex}: {len(recs)} rows from /stocks")
         all_recs.extend(recs)
 
-    # Filter to stock-like instruments (exclude ETFs deterministically)
-    stock_recs = [r for r in all_recs if is_common_stock(r)]
+    stock_recs = [r for r in all_recs if is_stock(r)]
     print(f"[universe] After stock-only filter: {len(stock_recs)}")
 
-    # Extract symbols
-    symbols = []
-    for r in stock_recs:
-        sym = (r.get("symbol") or "").strip()
-        # Some symbols can include special characters (e.g., BRK.A). Keep as-is.
-        if sym:
-            symbols.append(sym)
-
-    symbols = sorted(set(symbols))
+    symbols = sorted(set((r.get("symbol") or "").strip() for r in stock_recs if (r.get("symbol") or "").strip()))
     print(f"[universe] Unique symbols pre-price-filter: {len(symbols)}")
 
-    # Price filter
+    if max_symbols and max_symbols > 0:
+        symbols = symbols[:max_symbols]
+        print(f"[universe] TEST MODE: limiting to first {max_symbols} symbols")
+
     kept: List[str] = []
     skipped_no_price = 0
     skipped_below = 0
 
-    print(f"[universe] Applying price filter > {min_price:.2f} using /price (paced) ...")
+    print(f"[universe] Applying price filter > {min_price:.2f} using /price (paced at {max_per_minute}/min) ...")
     for i, sym in enumerate(symbols, start=1):
         limiter.wait()
         px = fetch_price(apikey, sym)
@@ -193,7 +175,7 @@ def main() -> int:
             else:
                 skipped_below += 1
 
-        if i % 200 == 0:
+        if i % 100 == 0:
             print(f"[universe] progress {i}/{len(symbols)} kept={len(kept)} no_price={skipped_no_price} below={skipped_below}")
 
     out_path = os.getenv("UNIVERSE_OUTFILE", "universe.txt")
@@ -204,10 +186,7 @@ def main() -> int:
     print(f"[universe] kept: {len(kept)}")
     print(f"[universe] skipped_no_price: {skipped_no_price}")
     print(f"[universe] skipped_below_threshold: {skipped_below}")
-
-    # Helpful: show first few tickers in logs
-    preview = kept[:20]
-    print("[universe] preview:", ", ".join(preview))
+    print("[universe] preview:", ", ".join(kept[:20]))
 
     return 0
 
