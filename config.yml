@@ -1,5 +1,7 @@
 api:
   interval: 1day
+
+  # Enough history for pivots + EMA50 + base highs, plus buffer
   outputsize: 520
 
   # Batch symbols per API call (1 symbol ~= 1 credit)
@@ -8,21 +10,28 @@ api:
   # Provider per-minute cap (Grow 55 == 55 credits/min)
   max_api_credits_per_min: 50
 
-# RUN-UP + EMA Touch Triangle (10/20/50) logic
 runup_ema_touch:
+  # ===== Breakout + run-up inputs (match Pine) =====
   baseBars: 20
   minRunUpPct: 30.0
   minPullbackPct: 5.0
   pivotL: 3
   pivotR: 3
-  pullbackBasis: "Close"   # "Low" or "Close"
+  pullbackBasis: Close   # "Low" or "Close"
+  priority: "10>20>50"   # "10>20>50" or "Closest to Close"
 
-  emaSrc: "close"          # close by default
+  # ===== EMA inputs =====
+  emaSrc: close
   len10: 10
   len20: 20
   len50: 50
 
-  priority: "10>20>50"     # or "Closest to Close"
+  # ===== Your filters =====
+  min_history_days: 90     # ~3 months
+  min_price: 2.0           # minimum latest close
 
-  # NEW: include triangles from the last N daily bars
-  watch_last_n_bars: 5
+  # ===== Watch behaviour =====
+  watch_last_n_bars: 5     # "use last 5 days"
+
+  # ===== Higher-low filter after triangle =====
+  higher_low_lookback: 10  # matches your Higher Lows script lookback
