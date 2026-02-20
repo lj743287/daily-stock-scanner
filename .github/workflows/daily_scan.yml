@@ -1,4 +1,4 @@
-name: Daily Scan (build universe + scan)
+name: Daily Scan (scan only)
 
 on:
   workflow_dispatch:
@@ -7,29 +7,21 @@ on:
     - cron: "0 1 * * *"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: daily-scan
   cancel-in-progress: false
 
 jobs:
-  build_universe_and_scan:
+  scan:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Ensure main is up to date
-        run: |
-          set -e
-          git fetch origin main
-          git checkout main
-          git pull --rebase origin main
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,34 +32,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Build universe.txt from Twelve Data
-        env:
-          TWELVE_DATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-          UNIVERSE_MIN_PRICE: "1.50"
-          TD_MAX_REQUESTS_PER_MINUTE: "50"
-          UNIVERSE_OUTFILE: "universe.txt"
-        run: |
-          python build_universe.py
-
-      - name: Commit and push updated universe.txt (if changed)
-        run: |
-          set -e
-
-          if git status --porcelain | grep -q "^ M universe.txt\|^?? universe.txt"; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-            git add universe.txt
-            git commit -m "Update universe.txt" || echo "Nothing to commit"
-
-            git fetch origin main
-            git rebase origin/main || (git rebase --abort && exit 1)
-
-            git push origin main
-          else
-            echo "No changes to universe.txt"
-          fi
 
       - name: Run daily scanner
         env:
