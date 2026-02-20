@@ -1,10 +1,10 @@
-name: Daily Scan (scan only)
+name: Daily Scan (scan after US close)
 
 on:
   workflow_dispatch:
   schedule:
-    # Daily at 01:00 UTC
-    - cron: "0 1 * * *"
+    # Daily at 22:00 UTC (after US cash close)
+    - cron: "0 22 * * *"
 
 permissions:
   contents: read
